@@ -8,7 +8,7 @@ import org.junit.Test
 class PresetsTest {
     @Test fun everyBuiltInPresetIsWithinValidRanges() {
         for (p in Presets.builtIn) assertEquals(p.name, p.params, p.params.validated())
-        assertEquals(6, Presets.builtIn.size)
+        assertEquals(15, Presets.builtIn.size)
         assertEquals(Presets.builtIn.size, Presets.builtIn.map { it.id }.toSet().size)
     }
 
@@ -36,9 +36,9 @@ class PresetsTest {
 
     @Test fun codecRoundTripKeepsEverything() {
         val p = EffectParams(
-            bypass = true, inputGainDb = 7.5f, outputVolume = 1.2f, highPassEnabled = false,
+            bypass = true, inputGainDb = 7.5f, outputVolume = 1.2f, dryWet = 0.6f, limiterCeilingDb = -3f, highPassEnabled = false,
             noiseReductionEnabled = true, noiseReductionStrength = 0.77f, gateEnabled = true, gateThresholdDb = -42f,
-            bassDb = 3.5f, midDb = -2f, trebleDb = 4f, voiceMode = VoiceMode.ROBOT, customPitchSemitones = 3f,
+            bassDb = 3.5f, midDb = -2f, trebleDb = 4f, voiceMode = VoiceMode.ROBOT, pitchSemitones = 3f,
             echoEnabled = true, echoDelayMs = 420f, echoFeedback = 0.55f, echoMix = 0.4f,
             reverbEnabled = true, reverbRoom = 0.9f, reverbMix = 0.35f
         )
@@ -57,7 +57,7 @@ class PresetsTest {
     @Test fun validationClampsEveryRange() {
         val v = EffectParams(
             outputVolume = 9f, noiseReductionStrength = 3f, gateThresholdDb = 10f, bassDb = -99f, midDb = 99f,
-            trebleDb = 99f, customPitchSemitones = 99f, echoDelayMs = 1f, echoFeedback = 2f, echoMix = -1f,
+            trebleDb = 99f, pitchSemitones = 99f, echoDelayMs = 1f, echoFeedback = 2f, echoMix = -1f,
             reverbRoom = 5f, reverbMix = 5f
         ).validated()
         assertEquals(Limits.VOLUME_MAX, v.outputVolume, 0f)
@@ -65,7 +65,7 @@ class PresetsTest {
         assertEquals(Limits.GATE_MAX_DB, v.gateThresholdDb, 0f)
         assertEquals(-Limits.TONE_MAX_DB, v.bassDb, 0f)
         assertEquals(Limits.TONE_MAX_DB, v.midDb, 0f)
-        assertEquals(Limits.PITCH_MAX_ST, v.customPitchSemitones, 0f)
+        assertEquals(Limits.PITCH_MAX_ST, v.pitchSemitones, 0f)
         assertEquals(Limits.ECHO_DELAY_MIN_MS, v.echoDelayMs, 0f)
         assertEquals(Limits.ECHO_FEEDBACK_MAX, v.echoFeedback, 0f)
         assertEquals(0f, v.echoMix, 0f)

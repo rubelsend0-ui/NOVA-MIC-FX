@@ -1,0 +1,2653 @@
+diff --git a/.github/workflows/android-build.yml b/.github/workflows/android-build.yml
+index baadec9..0067271 100644
+--- a/.github/workflows/android-build.yml
++++ b/.github/workflows/android-build.yml
+@@ -1,4 +1,4 @@
+-name: NOVA MIC FX Android APK Build
++name: Android Build
+ 
+ on:
+   push:
+@@ -10,58 +10,92 @@ on:
+ permissions:
+   contents: read
+ 
++concurrency:
++  group: android-build-${{ github.ref }}
++  cancel-in-progress: true
++
+ jobs:
+   build:
+-    name: Build Debug APK
++    name: Test and build debug APK
+     runs-on: ubuntu-latest
+-
+-    env:
+-      ANDROID_HOME: /usr/local/lib/android/sdk
+-      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
++    timeout-minutes: 30
+ 
+     steps:
+-      - name: Checkout source
++      - name: Checkout
+         uses: actions/checkout@v4
+ 
+-      - name: Set up Java 17
++      - name: Set up JDK 17
+         uses: actions/setup-java@v4
+         with:
+           distribution: temurin
+           java-version: '17'
+ 
+-      - name: Check Android SDK installation
+-        run: |
+-          echo "SDK path: $ANDROID_HOME"
+-          ls -la "$ANDROID_HOME"
+-          find "$ANDROID_HOME/cmdline-tools" -maxdepth 4 -name sdkmanager -type f
+-          find "$ANDROID_HOME/platforms" -maxdepth 1 -type d
++      - name: Set up Android SDK
++        uses: android-actions/setup-android@v3
+ 
+       - name: Install Android SDK packages
+-        run: |
+-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+-          if [ ! -x "$SDKMANAGER" ]; then
+-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -maxdepth 4 -name sdkmanager -type f | head -n 1)"
+-          fi
+-          test -n "$SDKMANAGER"
+-          yes | "$SDKMANAGER" --licenses || true
+-          "$SDKMANAGER" --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
++        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+ 
+-      - name: Verify Gradle wrapper
++      # The repository ships gradle-wrapper.properties and launcher scripts. If the binary
++      # gradle-wrapper.jar is not present, generate the official wrapper (Gradle 8.7) here.
++      - name: Set up Gradle (only to generate a missing wrapper jar)
++        if: ${{ hashFiles('gradle/wrapper/gradle-wrapper.jar') == '' }}
++        uses: gradle/actions/setup-gradle@v4
++        with:
++          gradle-version: '8.7'
++
++      - name: Generate Gradle wrapper if missing
++        if: ${{ hashFiles('gradle/wrapper/gradle-wrapper.jar') == '' }}
+         run: |
+-          test -f gradlew
+-          test -f gradle/wrapper/gradle-wrapper.jar
+-          chmod +x gradlew
++          echo "gradle-wrapper.jar not found - generating official wrapper for Gradle 8.7"
++          mkdir -p /tmp/wrapgen
++          (cd /tmp/wrapgen && touch settings.gradle && gradle wrapper --gradle-version 8.7 --distribution-type bin)
++          mkdir -p gradle/wrapper
++          cp /tmp/wrapgen/gradle/wrapper/gradle-wrapper.jar gradle/wrapper/gradle-wrapper.jar
++          cp /tmp/wrapgen/gradlew gradlew
++          cp /tmp/wrapgen/gradlew.bat gradlew.bat
++
++      - name: Validate Gradle wrapper
++        if: ${{ hashFiles('gradle/wrapper/gradle-wrapper.jar') != '' }}
++        uses: gradle/actions/wrapper-validation@v4
++
++      - name: Make gradlew executable
++        run: chmod +x ./gradlew
++
++      - name: Enable Gradle caching
++        uses: gradle/actions/setup-gradle@v4
++
++      - name: Show Gradle and Java versions
++        run: ./gradlew --version
+ 
+       - name: Run unit tests
+-        run: ./gradlew testDebugUnitTest
++        run: ./gradlew testDebugUnitTest --stacktrace
+ 
+-      - name: Build Debug APK
+-        run: ./gradlew assembleDebug
++      - name: Build debug APK
++        run: ./gradlew assembleDebug --stacktrace
++
++      - name: Verify APK exists
++        run: |
++          APK=app/build/outputs/apk/debug/app-debug.apk
++          if [ ! -f "$APK" ]; then
++            echo "::error::Expected APK not found at $APK"
++            exit 1
++          fi
++          ls -l "$APK"
+ 
+-      - name: Upload APK
++      - name: Upload debug APK
+         uses: actions/upload-artifact@v4
+         with:
+           name: NOVA-MIC-FX-debug-apk
+           path: app/build/outputs/apk/debug/app-debug.apk
+           if-no-files-found: error
+-          retention-days: 7
++
++      - name: Upload test and build reports (kept even on failure)
++        if: always()
++        uses: actions/upload-artifact@v4
++        with:
++          name: build-reports
++          path: |
++            app/build/reports/tests/testDebugUnitTest
++            app/build/test-results/testDebugUnitTest
++          if-no-files-found: ignore
+diff --git a/README.md b/README.md
+index 933f9dc..e95b09b 100644
+--- a/README.md
++++ b/README.md
+@@ -4,30 +4,38 @@ Real-time microphone effects for Android (Kotlin, Jetpack Compose, Material 3, M
+ Package: `com.nova.micfx` - minSdk 26, targetSdk/compileSdk 34.
+ 
+ ## What it does (Mode A: live microphone FX)
+-The app captures the microphone with `AudioRecord`, processes it on a dedicated audio thread, and plays the
+-result through `AudioTrack` to **headphones**. Every control changes real DSP:
++NOVA captures the microphone with `AudioRecord`, processes it on a dedicated audio thread and plays it through
++`AudioTrack` to **headphones**. Every control changes real DSP:
+ 
+ | Feature | Implementation |
+ |---|---|
+-| Mic gain (-12..+24 dB) | Software gain on captured samples with per-sample smoothing. It does **not** change the phone's hardware microphone sensitivity. |
+-| Monitor volume | Smoothed output gain (0..150%) |
+-| Limiter / clipping | Peak limiter (instant attack, 80 ms release, hard ceiling 0.97). Input and output clipping are counted and shown. |
+-| High-pass 80 Hz | RBJ biquad |
+-| Noise reduction | Adaptive noise-floor suppressor (minimum-statistics floor, voice-activity detector, up to -24 dB) + separate noise gate. **Not AI noise cancellation**; it cannot remove noise while you speak. |
+-| Bass / voice presence / treble | Low shelf 120 Hz, peaking 2.5 kHz, high shelf 6 kHz (biquads, stability checked, gains glide) |
+-| Voice changer | Deep / Bright / Custom use a real duration-preserving pitch shifter (two crossfaded delay-line heads). Warm / Radio / Telephone are filter-only. Robot is ring modulation. |
+-| Echo effect | Delay line with damped feedback (feedback capped at 0.8, cannot run away). This is a deliberate effect, **not** echo cancellation. |
+-| Reverb | Comb + all-pass reverb with room size and wet/dry mix |
+-| System effects | Optional Android `NoiseSuppressor`, `AcousticEchoCanceler`, `AutomaticGainControl`. Availability is queried and the real enabled state is displayed. |
+-| Presets | Gaming, Clear Voice, Deep Voice, Noise Reduction, Radio, Natural, plus a locally saved Custom preset |
+-| Compatibility screen | Queries real device features, routes and effects; manual checklist |
+-
+-## IMPORTANT: Android routing limitation (Mode B is not supported)
+-A normal Android app **cannot** replace the microphone input of a game, Discord, a voice-chat app or a phone call.
+-Android gives every app its own capture stream from the system audio server; there is no public, supported API for
+-one app to inject processed audio into another app's microphone. NOVA MIC FX does not use root, hidden APIs,
+-accessibility tricks or "compatibility toggles", so the UI always reports external-app routing as **not supported**.
+-Processed audio stays inside NOVA MIC FX and is only heard on your headphones. Do not expect it to work in games.
++| Mic gain (-12..+24 dB) | Software gain on captured samples with per-sample smoothing. Does **not** change the phone's hardware mic sensitivity. |
++| Output gain / limiter | Smoothed output volume (0..150%) and a peak limiter with adjustable ceiling (-12..-0.3 dB). Clipping is counted and shown. |
++| Pitch (-12..+12 st) | Real duration-preserving pitch shifter (two crossfaded delay-line heads). Not a sample-rate trick. Adds ~20 ms. |
++| Voice presets | Natural, Clean, Deep, Low Pitch, High Pitch, Robot, Alien, Radio, Echo, Reverb, Gaming, Noise Reduction, Bright, Warm, Telephone, Custom (saved locally). Stable ids, search, selected indicator. |
++| Noise reduction | Adaptive noise-floor suppressor (minimum statistics, voice-activity detection, up to -24 dB) + noise gate. **Not AI noise cancellation.** |
++| Equalizer | Bass (120 Hz shelf), voice presence (2.5 kHz), treble (6 kHz shelf) biquads with gliding gains |
++| Echo / Reverb | Delay line with damped feedback (capped 0.8) / comb + all-pass reverb |
++| Dry/wet | Blend between unprocessed and processed voice |
++| System effects | Optional Android NoiseSuppressor / AEC / AGC; availability and the REAL enabled state are shown |
++| Recovery | Up to 2 automatic stream restarts after a dead audio stream (never after a blocked/unsafe route) |
++| Latency | Measured output-buffer queue + capture block (hardware delay not measurable) next to a buffer-size estimate |
++
++## IMPORTANT: Free Fire, WePlay and other voice-chat apps
++**NOVA MIC FX cannot put its voice into another app's microphone.** What was investigated for stock, non-rooted Android:
++
++- Every app gets its own capture stream from the audio server; `AudioRecord.setPreferredDevice()` and
++  `AudioManager` communication-device APIs only affect the calling app's own streams. They do not inject audio.
++- `AudioTrack` output is playback, never another app's microphone input.
++- `AudioPlaybackCapture` records *other apps' playback* (with permission); it cannot replace a microphone.
++- Accessibility services, overlays and notification access cannot route audio.
++- Root / privileged audio policy changes are outside an ordinary APK and are not used.
++- **Device-dependent, unverified:** a USB audio interface or a hardware voice changer connected over USB-C may be used as the
++  microphone by some apps on some phones. NOVA only detects a USB input and labels it "unverified".
++
++So the app shows "Direct injection: unavailable" and never "Compatible with Free Fire/WePlay". Practical options:
++use the game's own voice effects/noise suppression, a hardware voice changer / USB audio interface, or (on PC) a virtual audio cable.
++NOVA stays useful as a live headphone voice-effects monitor and to find settings you like.
+ 
+ ## Safety / feedback
+ - Monitoring is blocked through the phone speaker (feedback howl) unless you allow it in Settings.
+@@ -81,6 +89,16 @@ APK: `app/build/outputs/apk/debug/app-debug.apk`
+ workflow detects this and generates the official Gradle 8.7 wrapper automatically. For local builds run once:
+ `gradle wrapper --gradle-version 8.7` (or just open the project in Android Studio).
+ 
++## Updating an existing repository with this ZIP
++```
++cd YOUR_REPO_FOLDER
++git pull origin main
++unzip -o ../NOVA-MIC-FX.zip -d ..      # overwrites files with the same names
++git status
++git add -A && git commit -m "Upgrade NOVA MIC FX" && git push origin main
++```
++Check `git status` first: if you edited files yourself, review the diff before committing.
++
+ ## Push to GitHub from Termux
+ ```
+ pkg update && pkg install unzip git gh
+diff --git a/app/src/main/java/com/nova/micfx/audio/AudioEngine.kt b/app/src/main/java/com/nova/micfx/audio/AudioEngine.kt
+index 4bb105f..f8cd343 100644
+--- a/app/src/main/java/com/nova/micfx/audio/AudioEngine.kt
++++ b/app/src/main/java/com/nova/micfx/audio/AudioEngine.kt
+@@ -18,7 +18,11 @@ import com.nova.micfx.settings.AudioSettingsRepository
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ 
+-private class EngineException(message: String) : Exception(message)
++private class EngineException(
++    message: String,
++    val kind: FailureKind = FailureKind.OTHER,
++    val recoverable: Boolean = false
++) : Exception(message)
+ 
+ /**
+  * Live microphone monitoring engine (MODE A). Captures with AudioRecord, processes on a dedicated
+@@ -26,6 +30,7 @@ private class EngineException(message: String) : Exception(message)
+  *
+  * Safety: monitoring through the phone speaker is blocked unless the user explicitly allows it, and
+  * the real output route is verified after start-up and re-checked while running.
++ * Only one engine instance exists (owned by [com.nova.micfx.NovaApp]) and only one audio thread runs at a time.
+  */
+ class AudioEngine(context: Context, private val settings: AudioSettingsRepository) {
+     private val appContext = context.applicationContext
+@@ -42,6 +47,7 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+ 
+     @Volatile private var stopRequested = false
+     @Volatile private var stopReason: String? = null
++    @Volatile private var stopKind = FailureKind.NONE
+     @Volatile private var activeInputId = -1
+     @Volatile private var activeOutputId = -1
+     private var thread: Thread? = null
+@@ -49,8 +55,10 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+ 
+     fun init() {
+         devices.start { removed ->
+-            if (machine.state == EngineState.RUNNING && (removed.id == activeInputId || removed.id == activeOutputId)) {
+-                stopWithReason("Stopped: ${AudioDeviceManager.describe(removed)} was disconnected.")
++            if ((machine.state == EngineState.RUNNING || machine.state == EngineState.RECOVERING) &&
++                (removed.id == activeInputId || removed.id == activeOutputId)
++            ) {
++                stopWithReason("Stopped: ${AudioDeviceManager.describe(removed)} was disconnected.", FailureKind.DEVICE_DISCONNECTED)
+             }
+         }
+     }
+@@ -63,19 +71,25 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+     fun hasPermission(): Boolean =
+         ContextCompat.checkSelfPermission(appContext, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+ 
++    /** Starts monitoring. Repeated calls while starting/running are ignored (returns false). */
+     fun start(): Boolean {
+         synchronized(lock) {
+             val s = machine.state
+-            if (s == EngineState.STARTING || s == EngineState.RUNNING || s == EngineState.STOPPING) return false
++            if (s == EngineState.STARTING || s == EngineState.RUNNING || s == EngineState.RECOVERING || s == EngineState.STOPPING) return false
++            if (thread?.isAlive == true) return false           // never two audio threads
+             if (!hasPermission()) {
+                 machine.transition(EngineState.ERROR)
+-                publish { it.copy(state = EngineState.ERROR, message = "Microphone permission not granted",
+-                    errorDetail = "Allow microphone access for NOVA MIC FX in Android settings, then press Start.") }
++                _snapshot.value = EngineSnapshot(
++                    state = EngineState.ERROR, message = "Microphone permission not granted",
++                    errorDetail = "Allow microphone access for NOVA MIC FX in Android settings, then press Start.",
++                    failure = FailureKind.PERMISSION
++                )
+                 return false
+             }
+             machine.transition(EngineState.STARTING)
+             stopRequested = false
+             stopReason = null
++            stopKind = FailureKind.NONE
+             _snapshot.value = EngineSnapshot(state = EngineState.STARTING, message = "Starting audio engine...")
+             thread = Thread({ runLoop() }, "NovaAudioThread").also { it.start() }
+             return true
+@@ -83,13 +97,14 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+     }
+ 
+     /** Safe to call at any time and from any thread; never blocks. */
+-    fun stop() { stopWithReason(null) }
++    fun stop() { stopWithReason(null, FailureKind.NONE) }
+ 
+-    private fun stopWithReason(reason: String?) {
++    private fun stopWithReason(reason: String?, kind: FailureKind) {
+         synchronized(lock) {
+             val s = machine.state
+             if (s == EngineState.IDLE || s == EngineState.ERROR || s == EngineState.STOPPING) return
+             if (reason != null) stopReason = reason
++            stopKind = kind
+             stopRequested = true
+             machine.transition(EngineState.STOPPING)
+             publish { it.copy(state = EngineState.STOPPING, message = "Stopping...") }
+@@ -106,7 +121,7 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+             .setAcceptsDelayedFocusGain(false)
+             .setOnAudioFocusChangeListener { change ->
+                 if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+-                    stopWithReason("Stopped: another app or a call took audio focus.")
++                    stopWithReason("Stopped: another app or a call took audio focus.", FailureKind.AUDIO_FOCUS)
+                 }
+             }.build()
+         focusRequest = req
+@@ -124,20 +139,71 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+     }
+ 
+     private fun runLoop() {
+-        var record: AudioRecord? = null
+-        var track: AudioTrack? = null
+-        val effects = AudioEffectController()
+         var error: String? = null
+         var detail: String? = null
++        var kind = FailureKind.NONE
++        var attempts = 0
+         try {
+             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+-            val s = settings.settings.value
++            while (true) {
++                try {
++                    runSession(attempts)
++                    break
++                } catch (e: EngineException) {
++                    val canRetry = e.recoverable && settings.settings.value.autoRecover && attempts < MAX_RECOVERY && !stopRequested
++                    if (canRetry) {
++                        attempts++
++                        val n = attempts
++                        synchronized(lock) {
++                            if (!stopRequested) machine.transition(EngineState.RECOVERING)
++                            publish { it.copy(state = EngineState.RECOVERING, recoveryAttempt = n,
++                                message = "Recovering audio (attempt $n of $MAX_RECOVERY)...", errorDetail = e.message) }
++                        }
++                        Thread.sleep(600)
++                        continue
++                    }
++                    error = e.message
++                    kind = e.kind
++                    break
++                }
++            }
++        } catch (e: SecurityException) {
++            error = "Microphone access was denied by Android."
++            kind = FailureKind.PERMISSION
++            detail = e.message
++        } catch (e: Throwable) {
++            error = "Audio engine failure: ${e.javaClass.simpleName}"
++            detail = e.message
++        } finally {
++            activeInputId = -1
++            activeOutputId = -1
++            val err = error
++            synchronized(lock) {
++                val st = machine.state
++                if (err != null && st != EngineState.STOPPING) {
++                    machine.transition(EngineState.ERROR)
++                    _snapshot.value = EngineSnapshot(state = EngineState.ERROR, message = err, errorDetail = detail, failure = kind)
++                } else {
++                    if (st != EngineState.STOPPING) machine.transition(EngineState.STOPPING)
++                    machine.transition(EngineState.IDLE)
++                    _snapshot.value = EngineSnapshot(state = EngineState.IDLE, message = stopReason ?: "Stopped", failure = stopKind)
++                }
++            }
++        }
++    }
+ 
++    /** One capture/playback session. Always releases every native resource before returning or throwing. */
++    private fun runSession(attempt: Int) {
++        var record: AudioRecord? = null
++        var track: AudioTrack? = null
++        val effects = AudioEffectController()
++        try {
++            val s = settings.settings.value
+             val nativeRate = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_SAMPLE_RATE)?.toIntOrNull() ?: 0
+             val rate = BufferSizing.chooseSampleRate(s.preferredSampleRate, nativeRate) { r ->
+                 AudioRecord.getMinBufferSize(r, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) > 0 &&
+                     AudioTrack.getMinBufferSize(r, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT) > 0
+-            } ?: throw EngineException("No supported sample rate (48000/44100/16000 Hz) is available on this device.")
++            } ?: throw EngineException("No supported sample rate (48000/44100/16000 Hz) is available on this device.", FailureKind.UNSUPPORTED_FORMAT)
+ 
+             val block = BufferSizing.blockFrames(rate)
+             val burst = audioManager.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)?.toIntOrNull() ?: block
+@@ -148,7 +214,15 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+                 AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT),
+                 block, s.bufferMultiplier)
+ 
+-            if (!requestFocus()) throw EngineException("Audio focus was denied (a call or another app is using audio).")
++            if (!requestFocus()) throw EngineException("Audio focus was denied (a call or another app is using audio).", FailureKind.AUDIO_FOCUS)
++
++            val notes = ArrayList<String>()
++            val inIds = devices.inputs.value.map { it.id }
++            val outIds = devices.outputs.value.map { it.id }
++            val inPref = DevicePreference.resolve(s.preferredInputId, inIds)
++            val outPref = DevicePreference.resolve(s.preferredOutputId, outIds)
++            if (DevicePreference.isMissing(s.preferredInputId, inIds)) notes.add("Preferred microphone is not connected; using the system default.")
++            if (DevicePreference.isMissing(s.preferredOutputId, outIds)) notes.add("Preferred output is not connected; using the system default.")
+ 
+             val source = if (s.useCommunicationSource) MediaRecorder.AudioSource.VOICE_COMMUNICATION else MediaRecorder.AudioSource.MIC
+             val rec: AudioRecord = AudioRecord.Builder()
+@@ -161,9 +235,9 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+                 .build()
+             record = rec
+             if (rec.state != AudioRecord.STATE_INITIALIZED) {
+-                throw EngineException("The microphone could not be opened. Another app may be using it, or access is blocked.")
++                throw EngineException("The microphone could not be opened. Another app may be using it, or access is blocked.", FailureKind.MIC_BUSY)
+             }
+-            if (s.preferredInputId >= 0) devices.findInput(s.preferredInputId)?.let { rec.setPreferredDevice(it) }
++            if (inPref != null) devices.findInput(inPref)?.let { rec.setPreferredDevice(it) }
+ 
+             val trk: AudioTrack = AudioTrack.Builder()
+                 .setAudioAttributes(AudioAttributes.Builder()
+@@ -179,18 +253,20 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+                 .build()
+             track = trk
+             if (trk.state != AudioTrack.STATE_INITIALIZED) throw EngineException("Audio output could not be opened.")
+-            if (s.preferredOutputId >= 0) devices.findOutput(s.preferredOutputId)?.let { trk.setPreferredDevice(it) }
++            if (outPref != null) devices.findOutput(outPref)?.let { trk.setPreferredDevice(it) }
+             // Keep the playback buffer small for low latency; it grows automatically after an underrun.
+-            val initialFrames = minOf(trk.bufferCapacityInFrames, maxOf(block, burst) * 2 * s.bufferMultiplier.coerceIn(1, 4) / 2)
++            val initialFrames = minOf(trk.bufferCapacityInFrames, maxOf(block, burst) * s.bufferMultiplier.coerceIn(1, 4))
+             trk.setBufferSizeInFrames(maxOf(initialFrames, block))
+ 
+             val fx = effects.attach(rec.audioSessionId, s.requestSystemNs, s.requestSystemAec, s.requestSystemAgc)
++            notes.addAll(fx.notes)
+ 
+             val pipeline = AudioProcessingPipeline(rate)
+             val shortIn = ShortArray(block)
+             val shortOut = ShortArray(block)
+             val floatBuf = FloatArray(block)
+             val silence = ShortArray(block)
++            var framesWritten = 0L
+ 
+             rec.startRecording()
+             trk.play()
+@@ -199,34 +275,37 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+             for (i in 0 until 8) {
+                 if (stopRequested) break
+                 val r = rec.read(shortIn, 0, block, AudioRecord.READ_BLOCKING)
+-                if (r < 0) throw EngineException("Microphone read failed (error $r).")
+-                trk.write(silence, 0, block, AudioTrack.WRITE_BLOCKING)
++                if (r < 0) throw EngineException("Microphone read failed (error $r).", FailureKind.OTHER, r == AudioRecord.ERROR_DEAD_OBJECT)
++                val w = trk.write(silence, 0, block, AudioTrack.WRITE_BLOCKING)
++                if (w < 0) throw EngineException("Audio output write failed (error $w).", FailureKind.OTHER, w == AudioTrack.ERROR_DEAD_OBJECT)
++                framesWritten += w
+             }
+             val routedOut = trk.routedDevice
+             val routedIn = rec.routedDevice
+-            if (!isSafeOutput(routedOut, s.allowSpeakerMonitoring)) {
++            if (!stopRequested && !isSafeOutput(routedOut, s.allowSpeakerMonitoring)) {
+                 throw EngineException(
+                     "Monitoring blocked: output is " + (if (routedOut != null) AudioDeviceManager.describe(routedOut) else "the phone speaker") +
+-                        ". Connect headphones to avoid feedback, or allow speaker monitoring in Settings."
++                        ". Connect headphones to avoid feedback, or allow speaker monitoring in Settings.",
++                    FailureKind.UNSUPPORTED_ROUTE
+                 )
+             }
+             activeInputId = routedIn?.id ?: -1
+             activeOutputId = routedOut?.id ?: -1
+ 
+-            val latencyMs = BufferSizing.durationMs(block, rate) + BufferSizing.durationMs(trk.bufferSizeInFrames, rate)
++            val estimate = BufferSizing.durationMs(block, rate) + BufferSizing.durationMs(trk.bufferSizeInFrames, rate)
+             synchronized(lock) {
+                 if (!stopRequested && machine.transition(EngineState.RUNNING)) {
+-                    publish {
+-                        EngineSnapshot(
+-                            state = EngineState.RUNNING, message = "Monitoring live",
+-                            inputDevice = AudioDeviceManager.describe(routedIn),
+-                            outputDevice = if (routedOut != null) AudioDeviceManager.describe(routedOut) else "Unverified route",
+-                            outputVerifiedSafe = true, sampleRate = rate, blockFrames = block,
+-                            latencyEstimateMs = latencyMs,
+-                            systemNsActive = fx.ns, systemAecActive = fx.aec, systemAgcActive = fx.agc,
+-                            effectNotes = fx.notes
+-                        )
+-                    }
++                    _snapshot.value = EngineSnapshot(
++                        state = EngineState.RUNNING,
++                        message = if (attempt > 0) "Monitoring live (recovered)" else "Monitoring live",
++                        recoveryAttempt = attempt,
++                        inputDevice = AudioDeviceManager.describe(routedIn),
++                        outputDevice = if (routedOut != null) AudioDeviceManager.describe(routedOut) else "Unverified route",
++                        outputVerifiedSafe = true, sampleRate = rate, blockFrames = block,
++                        latencyEstimateMs = estimate,
++                        systemNsActive = fx.ns, systemAecActive = fx.aec, systemAgcActive = fx.agc,
++                        effectNotes = notes
++                    )
+                 }
+             }
+ 
+@@ -237,12 +316,13 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+             var zeroBlocks = 0
+             var lastUnderruns = 0
+             var holdPeak = 0f
++            var measured = -1f
+             var lastPublish = SystemClock.elapsedRealtime()
+-            var lastRouteCheck = lastPublish
++            var lastCheck = lastPublish
+             while (!stopRequested) {
+                 val n = rec.read(shortIn, 0, block, AudioRecord.READ_BLOCKING)
+-                if (n < 0) throw EngineException("Microphone read failed (error $n).")
+-                if (n == 0) continue
++                if (n < 0) throw EngineException("Microphone read failed (error $n).", FailureKind.OTHER, n == AudioRecord.ERROR_DEAD_OBJECT)
++                if (n == 0) continue                                  // partial/empty reads are handled: only n frames are processed
+                 val t = System.nanoTime()
+                 if (t - lastRead > blockNs * 5 / 2) lateReads++
+                 lastRead = t
+@@ -258,41 +338,47 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+                 pipeline.setParams(_params.value)
+                 pipeline.process(floatBuf, n)
+                 for (i in 0 until n) shortOut[i] = DspMath.floatToShort(floatBuf[i])
+-                val w = trk.write(shortOut, 0, n, AudioTrack.WRITE_BLOCKING)
+-                if (w < 0) throw EngineException("Audio output write failed (error $w).")
++
++                var off = 0                                           // handle partial writes
++                var zeroWrites = 0
++                while (off < n && !stopRequested) {
++                    val w = trk.write(shortOut, off, n - off, AudioTrack.WRITE_BLOCKING)
++                    if (w < 0) throw EngineException("Audio output write failed (error $w).", FailureKind.OTHER, w == AudioTrack.ERROR_DEAD_OBJECT)
++                    if (w == 0 && ++zeroWrites > 3) break
++                    off += w
++                    framesWritten += w
++                }
+ 
+                 val now = SystemClock.elapsedRealtime()
+                 if (now - lastPublish >= 50) {
+-                    val frameDt = now - lastPublish
++                    val dt = now - lastPublish
+                     lastPublish = now
+-                    holdPeak = maxOf(pipeline.outputPeak, holdPeak - frameDt * 0.0004f)
++                    holdPeak = maxOf(pipeline.outputPeak, holdPeak - dt * 0.0004f)
+                     val under = trk.underrunCount
+                     if (under > lastUnderruns) {
+                         lastUnderruns = under
+-                        val grown = minOf(trk.bufferCapacityInFrames, trk.bufferSizeInFrames + burst)
+-                        trk.setBufferSizeInFrames(grown)
++                        trk.setBufferSizeInFrames(minOf(trk.bufferCapacityInFrames, trk.bufferSizeInFrames + burst))
+                     }
++                    // Measured: frames still queued in the output buffer (written minus played) plus one capture block.
++                    val head = trk.playbackHeadPosition.toLong() and 0xFFFFFFFFL
++                    val queued = (framesWritten - head).coerceAtLeast(0L)
++                    val sample = BufferSizing.durationMs(queued.toInt(), rate) + BufferSizing.durationMs(block, rate)
++                    measured = if (measured < 0f) sample else measured * 0.9f + sample * 0.1f
+                     val meters = pipeline.readMeters(holdPeak)
+-                    val lat = BufferSizing.durationMs(block, rate) + BufferSizing.durationMs(trk.bufferSizeInFrames, rate)
++                    val est = BufferSizing.durationMs(block, rate) + BufferSizing.durationMs(trk.bufferSizeInFrames, rate)
++                    val m = measured
+                     publish { it.copy(meters = meters, underruns = under, lateReads = lateReads,
+-                        inputSilent = zeroBlocks > 300, latencyEstimateMs = lat) }
++                        inputSilent = zeroBlocks > 300, latencyEstimateMs = est, measuredBufferLatencyMs = m) }
+                 }
+-                if (now - lastRouteCheck >= 250) {
+-                    lastRouteCheck = now
++                if (now - lastCheck >= 250) {
++                    lastCheck = now
++                    if (!hasPermission()) throw EngineException("Microphone permission was revoked.", FailureKind.PERMISSION)
+                     val out = trk.routedDevice
+                     if (out != null && !isSafeOutput(out, s.allowSpeakerMonitoring)) {
+-                        throw EngineException("Output switched to ${AudioDeviceManager.describe(out)}. Monitoring stopped to avoid feedback.")
++                        throw EngineException("Output switched to ${AudioDeviceManager.describe(out)}. Monitoring stopped to avoid feedback.", FailureKind.UNSUPPORTED_ROUTE)
+                     }
+                 }
+             }
+-        } catch (e: EngineException) {
+-            error = e.message
+-        } catch (e: SecurityException) {
+-            error = "Microphone access was denied by Android."
+-            detail = e.message
+-        } catch (e: Throwable) {
+-            error = "Audio engine failure: ${e.javaClass.simpleName}"
+-            detail = e.message
+         } finally {
+             try { record?.stop() } catch (_: Throwable) {}
+             try { record?.release() } catch (_: Throwable) {}
+@@ -301,22 +387,10 @@ class AudioEngine(context: Context, private val settings: AudioSettingsRepositor
+             try { track?.release() } catch (_: Throwable) {}
+             effects.release()
+             abandonFocus()
+-            activeInputId = -1
+-            activeOutputId = -1
+-            synchronized(lock) {
+-                val reason = stopReason
+-                if (error != null && machine.state != EngineState.STOPPING) {
+-                    machine.transition(EngineState.ERROR)
+-                    _snapshot.value = EngineSnapshot(state = EngineState.ERROR, message = error ?: "Error", errorDetail = detail)
+-                } else {
+-                    if (machine.state != EngineState.STOPPING) machine.transition(EngineState.STOPPING)
+-                    machine.transition(EngineState.IDLE)
+-                    _snapshot.value = EngineSnapshot(
+-                        state = EngineState.IDLE,
+-                        message = reason ?: error ?: "Stopped"
+-                    )
+-                }
+-            }
+         }
+     }
++
++    companion object {
++        const val MAX_RECOVERY = 2
++    }
+ }
+diff --git a/app/src/main/java/com/nova/micfx/audio/AudioModels.kt b/app/src/main/java/com/nova/micfx/audio/AudioModels.kt
+index eac4f40..78db450 100644
+--- a/app/src/main/java/com/nova/micfx/audio/AudioModels.kt
++++ b/app/src/main/java/com/nova/micfx/audio/AudioModels.kt
+@@ -1,16 +1,20 @@
+ package com.nova.micfx.audio
+ 
+-enum class EngineState { IDLE, STARTING, RUNNING, STOPPING, ERROR }
++enum class EngineState { IDLE, STARTING, RUNNING, RECOVERING, STOPPING, ERROR }
++
++/** Why the engine stopped or failed. Used to show a precise status and recovery instructions. */
++enum class FailureKind { NONE, PERMISSION, MIC_BUSY, AUDIO_FOCUS, UNSUPPORTED_ROUTE, DEVICE_DISCONNECTED, UNSUPPORTED_FORMAT, OTHER }
+ 
+ enum class VoiceMode(val label: String, val description: String, val isPitchShift: Boolean = false) {
+-    NATURAL("Natural", "No voice change."),
++    NATURAL("Natural", "No voice character change."),
+     DEEP("Deep", "Real pitch shifting down 4 semitones (duration preserved) plus low-end warmth.", true),
+     BRIGHT("Bright", "Real pitch shifting up 2 semitones plus presence and treble boost.", true),
+     WARM("Warm", "EQ only (no pitch shift): fuller lows, softer highs."),
+     RADIO("Radio", "Filter only (no pitch shift): band-limited 300-3400 Hz with presence."),
+     TELEPHONE("Telephone", "Filter only (no pitch shift): narrow 400-3000 Hz band."),
+-    ROBOT("Robot", "Ring modulation (50 Hz carrier). Metallic effect, no pitch shift."),
+-    CUSTOM("Custom", "Real pitch shifting by the number of semitones you choose.", true)
++    ROBOT("Robot", "Ring modulation with a 50 Hz carrier. Metallic, no pitch shift."),
++    ALIEN("Alien", "Pitch up 3 semitones plus 200 Hz ring modulation.", true),
++    CUSTOM("Custom", "No built-in character. Use the pitch slider and effects freely.")
+ }
+ 
+ /** Immutable parameter set. All values are clamped by [validated]. */
+@@ -18,6 +22,8 @@ data class EffectParams(
+     val bypass: Boolean = false,
+     val inputGainDb: Float = 0f,
+     val outputVolume: Float = 0.8f,
++    val dryWet: Float = 1f,
++    val limiterCeilingDb: Float = -0.5f,
+     val highPassEnabled: Boolean = true,
+     val noiseReductionEnabled: Boolean = false,
+     val noiseReductionStrength: Float = 0.5f,
+@@ -27,7 +33,7 @@ data class EffectParams(
+     val midDb: Float = 0f,
+     val trebleDb: Float = 0f,
+     val voiceMode: VoiceMode = VoiceMode.NATURAL,
+-    val customPitchSemitones: Float = 0f,
++    val pitchSemitones: Float = 0f,
+     val echoEnabled: Boolean = false,
+     val echoDelayMs: Float = 250f,
+     val echoFeedback: Float = 0.3f,
+@@ -39,24 +45,35 @@ data class EffectParams(
+     fun validated(): EffectParams = copy(
+         inputGainDb = inputGainDb.safe(Limits.GAIN_MIN_DB, Limits.GAIN_MAX_DB, 0f),
+         outputVolume = outputVolume.safe(0f, Limits.VOLUME_MAX, 0.8f),
++        dryWet = dryWet.safe(0f, 1f, 1f),
++        limiterCeilingDb = limiterCeilingDb.safe(Limits.LIMITER_MIN_DB, Limits.LIMITER_MAX_DB, -0.5f),
+         noiseReductionStrength = noiseReductionStrength.safe(0f, 1f, 0.5f),
+         gateThresholdDb = gateThresholdDb.safe(Limits.GATE_MIN_DB, Limits.GATE_MAX_DB, -50f),
+         bassDb = bassDb.safe(-Limits.TONE_MAX_DB, Limits.TONE_MAX_DB, 0f),
+         midDb = midDb.safe(-Limits.TONE_MAX_DB, Limits.TONE_MAX_DB, 0f),
+         trebleDb = trebleDb.safe(-Limits.TONE_MAX_DB, Limits.TONE_MAX_DB, 0f),
+-        customPitchSemitones = customPitchSemitones.safe(-Limits.PITCH_MAX_ST, Limits.PITCH_MAX_ST, 0f),
++        pitchSemitones = pitchSemitones.safe(-Limits.PITCH_MAX_ST, Limits.PITCH_MAX_ST, 0f),
+         echoDelayMs = echoDelayMs.safe(Limits.ECHO_DELAY_MIN_MS, Limits.ECHO_DELAY_MAX_MS, 250f),
+         echoFeedback = echoFeedback.safe(0f, Limits.ECHO_FEEDBACK_MAX, 0.3f),
+         echoMix = echoMix.safe(0f, 1f, 0.3f),
+         reverbRoom = reverbRoom.safe(0f, 1f, 0.5f),
+         reverbMix = reverbMix.safe(0f, 1f, 0.25f)
+     )
++
++    /** Resets every effect to its default but keeps gain, monitor volume, limiter and high-pass. */
++    fun resetEffects(): EffectParams {
++        val d = EffectParams()
++        return d.copy(inputGainDb = inputGainDb, outputVolume = outputVolume, limiterCeilingDb = limiterCeilingDb,
++            highPassEnabled = highPassEnabled).validated()
++    }
+ }
+ 
+ object Limits {
+     const val GAIN_MIN_DB = -12f
+     const val GAIN_MAX_DB = 24f
+     const val VOLUME_MAX = 1.5f
++    const val LIMITER_MIN_DB = -12f
++    const val LIMITER_MAX_DB = -0.3f
+     const val GATE_MIN_DB = -80f
+     const val GATE_MAX_DB = -20f
+     const val TONE_MAX_DB = 12f
+@@ -81,6 +98,7 @@ data class Meters(
+     val clipCount: Long = 0L,
+     val rawInputClipped: Boolean = false,
+     val reductionDb: Float = 0f,
++    val limiterReductionDb: Float = 0f,
+     val voiceActive: Boolean = false,
+     val noiseFloorDb: Float = -120f
+ )
+@@ -89,12 +107,17 @@ data class EngineSnapshot(
+     val state: EngineState = EngineState.IDLE,
+     val message: String = "Stopped",
+     val errorDetail: String? = null,
++    val failure: FailureKind = FailureKind.NONE,
++    val recoveryAttempt: Int = 0,
+     val inputDevice: String = "-",
+     val outputDevice: String = "-",
+     val outputVerifiedSafe: Boolean = false,
+     val sampleRate: Int = 0,
+     val blockFrames: Int = 0,
++    /** Buffer-size based worst-case estimate. */
+     val latencyEstimateMs: Float = 0f,
++    /** Measured: audio queued in the output buffer plus one capture block. Excludes hardware delay. Negative = not measured yet. */
++    val measuredBufferLatencyMs: Float = -1f,
+     val meters: Meters = Meters(),
+     val underruns: Int = 0,
+     val lateReads: Int = 0,
+@@ -112,10 +135,100 @@ data class EngineSettings(
+     val preferredOutputId: Int = -1,
+     val allowSpeakerMonitoring: Boolean = false,
+     val runInBackground: Boolean = false,
++    val autoRecover: Boolean = true,
+     val useCommunicationSource: Boolean = false,
+     val requestSystemNs: Boolean = false,
+     val requestSystemAec: Boolean = false,
+     val requestSystemAgc: Boolean = false
+-)
++) {
++    fun validated(): EngineSettings = copy(
++        preferredSampleRate = if (preferredSampleRate == 0 || BufferSizing.isSupportedRate(preferredSampleRate)) preferredSampleRate else 0,
++        bufferMultiplier = bufferMultiplier.coerceIn(1, 4),
++        preferredInputId = if (preferredInputId < -1) -1 else preferredInputId,
++        preferredOutputId = if (preferredOutputId < -1) -1 else preferredOutputId
++    )
++}
++
++/** Text codec for [EngineSettings]; decoding always validates. */
++object SettingsCodec {
++    fun encode(s: EngineSettings): String = listOf(
++        "sampleRate" to s.preferredSampleRate, "bufferMult" to s.bufferMultiplier,
++        "inId" to s.preferredInputId, "outId" to s.preferredOutputId,
++        "allowSpeaker" to s.allowSpeakerMonitoring, "background" to s.runInBackground,
++        "autoRecover" to s.autoRecover, "commSource" to s.useCommunicationSource,
++        "sysNs" to s.requestSystemNs, "sysAec" to s.requestSystemAec, "sysAgc" to s.requestSystemAgc
++    ).joinToString(";") { "${it.first}=${it.second}" }
++
++    fun decode(text: String?): EngineSettings {
++        if (text.isNullOrBlank()) return EngineSettings()
++        val m = HashMap<String, String>()
++        for (part in text.split(";")) {
++            val i = part.indexOf('=')
++            if (i > 0) m[part.substring(0, i)] = part.substring(i + 1)
++        }
++        val d = EngineSettings()
++        fun i(k: String, def: Int) = m[k]?.toIntOrNull() ?: def
++        fun b(k: String, def: Boolean) = m[k]?.toBooleanStrictOrNull() ?: def
++        return EngineSettings(
++            preferredSampleRate = i("sampleRate", d.preferredSampleRate),
++            bufferMultiplier = i("bufferMult", d.bufferMultiplier),
++            preferredInputId = i("inId", d.preferredInputId),
++            preferredOutputId = i("outId", d.preferredOutputId),
++            allowSpeakerMonitoring = b("allowSpeaker", d.allowSpeakerMonitoring),
++            runInBackground = b("background", d.runInBackground),
++            autoRecover = b("autoRecover", d.autoRecover),
++            useCommunicationSource = b("commSource", d.useCommunicationSource),
++            requestSystemNs = b("sysNs", d.requestSystemNs),
++            requestSystemAec = b("sysAec", d.requestSystemAec),
++            requestSystemAgc = b("sysAgc", d.requestSystemAgc)
++        ).validated()
++    }
++}
+ 
+ data class StageStatus(val name: String, val enabled: Boolean, val detail: String)
++
++/** What the dashboard shows. Derived only from verified engine state, never hard-coded. */
++enum class DisplayStatus(val label: String) {
++    READY("Ready"),
++    REQUESTING_PERMISSION("Requesting Permission"),
++    PERMISSION_NEEDED("Permission Needed"),
++    STARTING("Starting"),
++    MONITORING("Monitoring"),
++    RECOVERING("Recovering"),
++    STOPPING("Stopping"),
++    UNSUPPORTED_ROUTE("Unsupported Route"),
++    DEVICE_DISCONNECTED("Audio Device Disconnected"),
++    MIC_BUSY("Microphone Busy"),
++    ERROR("Error")
++}
++
++object StatusResolver {
++    fun resolve(snapshot: EngineSnapshot, permissionGranted: Boolean, permissionRequestPending: Boolean): DisplayStatus {
++        if (permissionRequestPending) return DisplayStatus.REQUESTING_PERMISSION
++        fun byFailure(): DisplayStatus? = when (snapshot.failure) {
++            FailureKind.PERMISSION -> DisplayStatus.PERMISSION_NEEDED
++            FailureKind.MIC_BUSY -> DisplayStatus.MIC_BUSY
++            FailureKind.UNSUPPORTED_ROUTE -> DisplayStatus.UNSUPPORTED_ROUTE
++            FailureKind.DEVICE_DISCONNECTED -> DisplayStatus.DEVICE_DISCONNECTED
++            else -> null
++        }
++        return when (snapshot.state) {
++            EngineState.STARTING -> DisplayStatus.STARTING
++            EngineState.RUNNING -> DisplayStatus.MONITORING
++            EngineState.RECOVERING -> DisplayStatus.RECOVERING
++            EngineState.STOPPING -> DisplayStatus.STOPPING
++            EngineState.ERROR -> byFailure() ?: DisplayStatus.ERROR
++            EngineState.IDLE -> byFailure() ?: if (!permissionGranted) DisplayStatus.PERMISSION_NEEDED else DisplayStatus.READY
++        }
++    }
++}
++
++/** Resolves a stored preferred-device id against the devices that really exist right now. */
++object DevicePreference {
++    /** @return the preferred id when it is currently available, otherwise null (use system default). */
++    fun resolve(preferredId: Int, availableIds: List<Int>): Int? =
++        if (preferredId >= 0 && availableIds.contains(preferredId)) preferredId else null
++
++    fun isMissing(preferredId: Int, availableIds: List<Int>): Boolean =
++        preferredId >= 0 && !availableIds.contains(preferredId)
++}
+diff --git a/app/src/main/java/com/nova/micfx/audio/AudioProcessingPipeline.kt b/app/src/main/java/com/nova/micfx/audio/AudioProcessingPipeline.kt
+index 3d91c3c..01d193c 100644
+--- a/app/src/main/java/com/nova/micfx/audio/AudioProcessingPipeline.kt
++++ b/app/src/main/java/com/nova/micfx/audio/AudioProcessingPipeline.kt
+@@ -7,20 +7,25 @@ data class VoiceProfile(
+     val midDb: Float = 0f,
+     val trebleDb: Float = 0f,
+     val ringMix: Float = 0f,
++    val ringHz: Float = 50f,
+     val bandLowHz: Float = 0f,
+     val bandHighHz: Float = 0f      // 0 = no band limiting
+ ) {
+     companion object {
+-        fun of(mode: VoiceMode, customSemitones: Float): VoiceProfile = when (mode) {
+-            VoiceMode.NATURAL -> VoiceProfile()
++        fun of(mode: VoiceMode): VoiceProfile = when (mode) {
++            VoiceMode.NATURAL, VoiceMode.CUSTOM -> VoiceProfile()
+             VoiceMode.DEEP -> VoiceProfile(pitchSemitones = -4f, bassDb = 4f)
+             VoiceMode.BRIGHT -> VoiceProfile(pitchSemitones = 2f, midDb = 2f, trebleDb = 4f)
+             VoiceMode.WARM -> VoiceProfile(bassDb = 4f, trebleDb = -3f)
+             VoiceMode.RADIO -> VoiceProfile(midDb = 3f, bandLowHz = 300f, bandHighHz = 3400f)
+             VoiceMode.TELEPHONE -> VoiceProfile(midDb = 2f, bandLowHz = 400f, bandHighHz = 3000f)
+-            VoiceMode.ROBOT -> VoiceProfile(ringMix = 0.8f)
+-            VoiceMode.CUSTOM -> VoiceProfile(pitchSemitones = customSemitones)
++            VoiceMode.ROBOT -> VoiceProfile(ringMix = 0.8f, ringHz = 50f)
++            VoiceMode.ALIEN -> VoiceProfile(pitchSemitones = 3f, ringMix = 0.5f, ringHz = 200f, midDb = 2f)
+         }
++
++        /** Total pitch shift in semitones that the pipeline will really apply. */
++        fun totalPitch(p: EffectParams): Float =
++            if (p.bypass) 0f else (of(p.voiceMode).pitchSemitones + p.pitchSemitones).coerceIn(-Limits.PITCH_MAX_ST, Limits.PITCH_MAX_ST)
+     }
+ }
+ 
+@@ -28,22 +33,22 @@ data class VoiceProfile(
+ object StageReport {
+     fun build(p: EffectParams): List<StageStatus> {
+         val fx = !p.bypass
+-        val voice = VoiceProfile.of(p.voiceMode, p.customPitchSemitones)
+-        val voiceName = when {
+-            p.voiceMode == VoiceMode.NATURAL -> "Voice: Natural"
+-            voice.pitchSemitones != 0f -> "Voice: ${p.voiceMode.label} (pitch ${"%+.0f".format(voice.pitchSemitones)} st)"
+-            else -> "Voice: ${p.voiceMode.label}"
+-        }
++        val voice = VoiceProfile.of(p.voiceMode)
++        val pitch = VoiceProfile.totalPitch(p)
++        val voiceName = if (p.voiceMode == VoiceMode.NATURAL || p.voiceMode == VoiceMode.CUSTOM) "Voice: ${p.voiceMode.label}" else "Voice: ${p.voiceMode.label}"
++        val voiceActive = fx && (p.voiceMode != VoiceMode.NATURAL && p.voiceMode != VoiceMode.CUSTOM)
+         return listOf(
+             StageStatus("Input gain", true, "%+.0f dB software gain".format(p.inputGainDb)),
+             StageStatus("High-pass 80 Hz", p.highPassEnabled, if (p.highPassEnabled) "Removes rumble" else "Off"),
+             StageStatus("Noise suppressor", fx && p.noiseReductionEnabled, if (p.bypass) "Bypassed" else "Adaptive noise-floor suppressor"),
+             StageStatus("Noise gate", fx && p.gateEnabled, if (p.bypass) "Bypassed" else "Threshold %.0f dB".format(p.gateThresholdDb)),
+-            StageStatus("Tone EQ", fx && (p.bassDb != 0f || p.midDb != 0f || p.trebleDb != 0f), "Bass/mid/treble biquads"),
+-            StageStatus(voiceName, fx && p.voiceMode != VoiceMode.NATURAL, if (p.bypass) "Bypassed" else p.voiceMode.description),
++            StageStatus("Pitch shift", fx && pitch != 0f, if (pitch != 0f) "%+.0f semitones (duration preserved)".format(pitch) else "Off"),
++            StageStatus("Tone EQ", fx && (p.bassDb != 0f || p.midDb != 0f || p.trebleDb != 0f || voice.bassDb != 0f || voice.midDb != 0f || voice.trebleDb != 0f), "Bass/mid/treble biquads"),
++            StageStatus(voiceName, voiceActive, if (p.bypass) "Bypassed" else p.voiceMode.description),
+             StageStatus("Echo effect", fx && p.echoEnabled, "Delay line with feedback"),
+             StageStatus("Reverb", fx && p.reverbEnabled, "Comb + all-pass reverb"),
+-            StageStatus("Limiter", true, "Always on, protects output")
++            StageStatus("Dry/wet mix", fx && p.dryWet < 0.999f, "%.0f%% processed".format(p.dryWet * 100f)),
++            StageStatus("Limiter", true, "Always on, ceiling %.1f dB".format(p.limiterCeilingDb))
+         )
+     }
+ }
+@@ -53,7 +58,7 @@ object StageReport {
+  * volatile reference so the UI thread can change them at any time.
+  *
+  * Order: gain -> high-pass -> noise reduction -> pitch / ring mod -> tone EQ -> band limit
+- *        -> echo -> reverb -> output volume -> limiter.
++ *        -> echo -> reverb -> dry/wet -> output volume -> limiter.
+  */
+ class AudioProcessingPipeline(val sampleRate: Int) {
+     @Volatile private var params: EffectParams = EffectParams()
+@@ -68,10 +73,13 @@ class AudioProcessingPipeline(val sampleRate: Int) {
+     private val echo = EchoProcessor(sampleRate)
+     private val reverb = ReverbProcessor(sampleRate)
+     private val limiter = LimiterProcessor(sampleRate)
++    private val dry = FloatArray(MAX_BLOCK)
+ 
+     private val smoothCoef = DspMath.smoothingCoefficient(15f, sampleRate)
+     private var curGain = 1f
+     private var curVolume = 0.8f
++    private var curMix = 1f
++    private var lastCeilingDb = Float.NaN
+ 
+     // Measurements of the most recent block
+     var inputPeak = 0f; private set
+@@ -97,6 +105,11 @@ class AudioProcessingPipeline(val sampleRate: Int) {
+         val fx = !p.bypass
+         val target = DspMath.dbToLinear(p.inputGainDb)
+ 
++        if (p.limiterCeilingDb != lastCeilingDb) {
++            lastCeilingDb = p.limiterCeilingDb
++            limiter.ceiling = DspMath.dbToLinear(p.limiterCeilingDb)
++        }
++
+         rawInputClipped = DspMath.countAtOrAbove(buf, n, 0.999f) > 0
+ 
+         // 1. Input gain with per-sample smoothing (no zipper noise / sudden jumps)
+@@ -116,14 +129,19 @@ class AudioProcessingPipeline(val sampleRate: Int) {
+         }
+         highPassWasOn = p.highPassEnabled
+ 
++        // Keep a dry copy for the dry/wet control (only when it is actually needed)
++        val mixOn = fx && (p.dryWet < 0.999f || curMix < 0.999f) && n <= dry.size
++        if (mixOn) System.arraycopy(buf, 0, dry, 0, n)
++
+         // 3. Noise reduction (also tracks voice activity for the UI when disabled)
+         noise.configure(fx && p.noiseReductionEnabled, p.noiseReductionStrength, fx && p.gateEnabled, p.gateThresholdDb)
+         noise.process(buf, n)
+ 
+-        // 4. Voice character
+-        val voice = if (fx) VoiceProfile.of(p.voiceMode, p.customPitchSemitones) else VoiceProfile()
+-        pitch.ratio = DspMath.semitonesToRatio(voice.pitchSemitones)
++        // 4. Voice character: real pitch shifting + ring modulation
++        val voice = if (fx) VoiceProfile.of(p.voiceMode) else VoiceProfile()
++        pitch.ratio = DspMath.semitonesToRatio(VoiceProfile.totalPitch(p))
+         pitch.process(buf, n)
++        ring.carrierHz = voice.ringHz
+         ring.process(buf, n, voice.ringMix)
+ 
+         // 5. Tone controls (user offsets + voice profile offsets)
+@@ -139,7 +157,20 @@ class AudioProcessingPipeline(val sampleRate: Int) {
+         reverb.configure(fx && p.reverbEnabled, p.reverbRoom, p.reverbMix)
+         reverb.process(buf, n)
+ 
+-        // 7. Output volume (smoothed) and limiter
++        // 7. Dry/wet blend (smoothed)
++        if (mixOn) {
++            var m = curMix
++            val tw = p.dryWet
++            for (i in 0 until n) {
++                m = tw + (m - tw) * smoothCoef
++                buf[i] = dry[i] * (1f - m) + buf[i] * m
++            }
++            curMix = m
++        } else {
++            curMix = if (fx) p.dryWet else 1f
++        }
++
++        // 8. Output volume (smoothed) and limiter
+         var v = curVolume
+         for (i in 0 until n) {
+             v = p.outputVolume + (v - p.outputVolume) * smoothCoef
+@@ -160,15 +191,20 @@ class AudioProcessingPipeline(val sampleRate: Int) {
+         outputPeak = outputPeak, outputRms = outputRms,
+         holdPeak = holdPeak, clipping = blockClipped, clipCount = totalClipped,
+         rawInputClipped = rawInputClipped,
+-        reductionDb = reductionDb, voiceActive = voiceActive, noiseFloorDb = noiseFloorDb
++        reductionDb = reductionDb, limiterReductionDb = limiterReductionDb,
++        voiceActive = voiceActive, noiseFloorDb = noiseFloorDb
+     )
+ 
+     fun reset() {
+         highPass.reset(); noise.reset(); pitch.reset(); tone.reset(); echo.reset(); reverb.reset(); limiter.reset()
+-        curGain = 1f; curVolume = params.outputVolume
++        curGain = 1f; curVolume = params.outputVolume; curMix = 1f
+     }
+ 
+-    /** Hard ceiling of the final limiter. */
++    /** Current ceiling of the final limiter (linear). */
+     val ceiling: Float get() = limiter.ceiling
+ 
++    companion object {
++        /** Largest block that supports the dry/wet blend without allocating. */
++        const val MAX_BLOCK = 8192
++    }
+ }
+diff --git a/app/src/main/java/com/nova/micfx/audio/CapabilityModel.kt b/app/src/main/java/com/nova/micfx/audio/CapabilityModel.kt
+new file mode 100644
+index 0000000..0aa1a99
+--- /dev/null
++++ b/app/src/main/java/com/nova/micfx/audio/CapabilityModel.kt
+@@ -0,0 +1,36 @@
++package com.nova.micfx.audio
++
++enum class CompatStatus { OK, WARN, NO, INFO }
++data class CompatItem(val title: String, val status: CompatStatus, val detail: String)
++
++/** The four things the compatibility screen must never mix up. */
++data class CapabilitySummary(
++    val processingInsideNova: CompatItem,
++    val localMonitoring: CompatItem,
++    val externalHardware: CompatItem,
++    val directInjection: CompatItem
++)
++
++object CapabilityModel {
++    fun summarize(hasMic: Boolean, permission: Boolean, headphones: Boolean, usbAudioInput: Boolean): CapabilitySummary {
++        val processing = when {
++            !hasMic -> CompatItem("1. Audio processing inside NOVA", CompatStatus.NO, "No microphone reported by the system.")
++            !permission -> CompatItem("1. Audio processing inside NOVA", CompatStatus.WARN, "Supported, but microphone permission is not granted yet.")
++            else -> CompatItem("1. Audio processing inside NOVA", CompatStatus.OK, "Supported: NOVA captures the microphone and applies its effects.")
++        }
++        val monitoring = when {
++            !hasMic || !permission -> CompatItem("2. Local monitoring", CompatStatus.WARN, "Needs microphone permission.")
++            !headphones -> CompatItem("2. Local monitoring", CompatStatus.WARN, "Connect headphones. Speaker monitoring is blocked by default to prevent feedback.")
++            else -> CompatItem("2. Local monitoring", CompatStatus.OK, "Possible: processed audio can be heard on your headphones.")
++        }
++        val hardware = if (usbAudioInput)
++            CompatItem("3. External hardware routing", CompatStatus.INFO,
++                "A USB audio input is connected. A hardware voice changer on it is a legitimate route, but whether another app uses it as its microphone depends on the phone and the app. NOT verified by NOVA.")
++        else
++            CompatItem("3. External hardware routing", CompatStatus.INFO,
++                "No USB audio input detected. A USB audio interface or hardware voice changer is the practical way to change your voice in other apps. Device-dependent, not verified by NOVA.")
++        val injection = CompatItem("4. Direct injection into other apps", CompatStatus.NO,
++            "Unavailable. Android has no supported API for an ordinary app to replace another app's microphone. NOVA never claims compatibility with Free Fire, WePlay, Discord or calls.")
++        return CapabilitySummary(processing, monitoring, hardware, injection)
++    }
++}
+diff --git a/app/src/main/java/com/nova/micfx/audio/CompatibilityChecker.kt b/app/src/main/java/com/nova/micfx/audio/CompatibilityChecker.kt
+index 0b8960f..e226014 100644
+--- a/app/src/main/java/com/nova/micfx/audio/CompatibilityChecker.kt
++++ b/app/src/main/java/com/nova/micfx/audio/CompatibilityChecker.kt
+@@ -3,13 +3,14 @@ package com.nova.micfx.audio
+ import android.Manifest
+ import android.content.Context
+ import android.content.pm.PackageManager
++import android.media.AudioDeviceInfo
++import android.media.AudioFormat
+ import android.media.AudioManager
++import android.media.AudioRecord
++import android.media.AudioTrack
+ import android.os.Build
+ import androidx.core.content.ContextCompat
+ 
+-enum class CompatStatus { OK, WARN, NO, INFO }
+-data class CompatItem(val title: String, val status: CompatStatus, val detail: String)
+-
+ /** Reports what this device can really do. Nothing here is assumed: every line comes from a platform query. */
+ class CompatibilityChecker(context: Context, private val devices: AudioDeviceManager) {
+     private val ctx = context.applicationContext
+@@ -36,6 +37,9 @@ class CompatibilityChecker(context: Context, private val devices: AudioDeviceMan
+         val burst = am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
+         list += CompatItem("Native output format", CompatStatus.INFO,
+             "Sample rate: ${rate ?: "unknown"} Hz, burst size: ${burst ?: "unknown"} frames.")
++        val rates = supportedSampleRates()
++        list += CompatItem("Supported sample rates", if (rates.isEmpty()) CompatStatus.NO else CompatStatus.OK,
++            if (rates.isEmpty()) "No supported rate found." else rates.joinToString(", ") { "$it Hz" })
+ 
+         val av = AudioEffectController.availability()
+         list += CompatItem("System noise suppressor", if (av.noiseSuppressor) CompatStatus.OK else CompatStatus.WARN,
+@@ -57,12 +61,24 @@ class CompatibilityChecker(context: Context, private val devices: AudioDeviceMan
+         list += CompatItem("Local monitoring (Mode A)", if (canMonitor) CompatStatus.OK else CompatStatus.WARN,
+             if (canMonitor) "Processed audio can be monitored on your headphones." else "Needs microphone permission and headphones.")
+ 
+-        list += CompatItem("Processed audio into other apps (Mode B)", CompatStatus.NO,
+-            "Not supported. Android has no public API that lets an ordinary app replace another app's microphone input. " +
+-                "NOVA MIC FX does not use root, hidden APIs or accessibility tricks, so it cannot feed games, Discord or calls.")
+ 
+         list += CompatItem("Android version", CompatStatus.INFO,
+             "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}). From Android 10, apps in the background may receive silence from the microphone.")
+         return list
+     }
++
++    /** Sample rates the platform really accepts for both capture and playback. */
++    fun supportedSampleRates(): List<Int> = BufferSizing.SUPPORTED_RATES.filter { r ->
++        AudioRecord.getMinBufferSize(r, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) > 0 &&
++            AudioTrack.getMinBufferSize(r, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT) > 0
++    }
++
++    fun summary(): CapabilitySummary {
++        val hasMic = pm.hasSystemFeature(PackageManager.FEATURE_MICROPHONE)
++        val perm = ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
++        val usbIn = am.getDevices(AudioManager.GET_DEVICES_INPUTS).any {
++            it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET || it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
++        }
++        return CapabilityModel.summarize(hasMic, perm, devices.hasHeadphoneOutput(), usbIn)
++    }
+ }
+diff --git a/app/src/main/java/com/nova/micfx/audio/EngineStateMachine.kt b/app/src/main/java/com/nova/micfx/audio/EngineStateMachine.kt
+index e2312db..0223d3e 100644
+--- a/app/src/main/java/com/nova/micfx/audio/EngineStateMachine.kt
++++ b/app/src/main/java/com/nova/micfx/audio/EngineStateMachine.kt
+@@ -1,6 +1,10 @@
+ package com.nova.micfx.audio
+ 
+-/** Thread-safe engine lifecycle: IDLE -> STARTING -> RUNNING -> STOPPING -> IDLE (ERROR from any active state). */
++/**
++ * Thread-safe engine lifecycle:
++ * IDLE -> STARTING -> RUNNING -> STOPPING -> IDLE, with RECOVERING for automatic stream recovery
++ * and ERROR reachable from every active state.
++ */
+ class EngineStateMachine {
+     private var current = EngineState.IDLE
+     val state: EngineState @Synchronized get() = current
+@@ -19,8 +23,9 @@ class EngineStateMachine {
+     companion object {
+         private val ALLOWED: Map<EngineState, Set<EngineState>> = mapOf(
+             EngineState.IDLE to setOf(EngineState.STARTING, EngineState.ERROR),
+-            EngineState.STARTING to setOf(EngineState.RUNNING, EngineState.STOPPING, EngineState.ERROR),
+-            EngineState.RUNNING to setOf(EngineState.STOPPING, EngineState.ERROR),
++            EngineState.STARTING to setOf(EngineState.RUNNING, EngineState.RECOVERING, EngineState.STOPPING, EngineState.ERROR),
++            EngineState.RUNNING to setOf(EngineState.STOPPING, EngineState.RECOVERING, EngineState.ERROR),
++            EngineState.RECOVERING to setOf(EngineState.RUNNING, EngineState.STOPPING, EngineState.ERROR),
+             EngineState.STOPPING to setOf(EngineState.IDLE),
+             EngineState.ERROR to setOf(EngineState.STARTING, EngineState.IDLE)
+         )
+diff --git a/app/src/main/java/com/nova/micfx/audio/LimiterProcessor.kt b/app/src/main/java/com/nova/micfx/audio/LimiterProcessor.kt
+index 209dc39..76dc3c1 100644
+--- a/app/src/main/java/com/nova/micfx/audio/LimiterProcessor.kt
++++ b/app/src/main/java/com/nova/micfx/audio/LimiterProcessor.kt
+@@ -6,7 +6,9 @@ import kotlin.math.abs
+  * Peak limiter: instant attack, smooth release, plus a hard safety clamp so the output can never
+  * exceed [ceiling]. Not-a-number samples are replaced by silence.
+  */
+-class LimiterProcessor(sampleRate: Int, val ceiling: Float = 0.97f, releaseMs: Float = 80f) {
++class LimiterProcessor(sampleRate: Int, ceiling: Float = 0.95f, releaseMs: Float = 80f) {
++    /** Output ceiling (linear). Can be changed while running. */
++    @Volatile var ceiling: Float = ceiling.coerceIn(0.05f, 0.999f)
+     private val releaseCoef = DspMath.smoothingCoefficient(releaseMs, sampleRate)
+     var gain = 1f
+         private set
+@@ -16,18 +18,19 @@ class LimiterProcessor(sampleRate: Int, val ceiling: Float = 0.97f, releaseMs: F
+ 
+     /** @return number of samples whose magnitude exceeded the ceiling before limiting. */
+     fun process(buf: FloatArray, n: Int): Int {
++        val c = ceiling
+         var over = 0
+         var g = gain
+         for (i in 0 until n) {
+             val x = buf[i]
+             if (x != x) { buf[i] = 0f; continue }
+             val a = abs(x)
+-            val needed = if (a > ceiling) ceiling / a else 1f
+-            if (a > ceiling) over++
++            val needed = if (a > c) c / a else 1f
++            if (a > c) over++
+             val released = 1f - (1f - g) * releaseCoef
+             g = if (needed < released) needed else released
+             var y = x * g
+-            if (y > ceiling) y = ceiling else if (y < -ceiling) y = -ceiling
++            if (y > c) y = c else if (y < -c) y = -c
+             buf[i] = y
+         }
+         gain = g
+diff --git a/app/src/main/java/com/nova/micfx/audio/PitchShifter.kt b/app/src/main/java/com/nova/micfx/audio/PitchShifter.kt
+index aefd77c..2875145 100644
+--- a/app/src/main/java/com/nova/micfx/audio/PitchShifter.kt
++++ b/app/src/main/java/com/nova/micfx/audio/PitchShifter.kt
+@@ -51,7 +51,7 @@ class PitchShifter(sampleRate: Int, windowMs: Float = 40f) {
+ }
+ 
+ /** Ring modulator used for the Robot voice. */
+-class RingModulator(private val sampleRate: Int, private val carrierHz: Float = 50f) {
++class RingModulator(private val sampleRate: Int, var carrierHz: Float = 50f) {
+     private var phase = 0.0
+     fun process(buf: FloatArray, n: Int, mix: Float) {
+         if (mix <= 0f) return
+diff --git a/app/src/main/java/com/nova/micfx/audio/Presets.kt b/app/src/main/java/com/nova/micfx/audio/Presets.kt
+index 4836bee..b7f2668 100644
+--- a/app/src/main/java/com/nova/micfx/audio/Presets.kt
++++ b/app/src/main/java/com/nova/micfx/audio/Presets.kt
+@@ -1,22 +1,15 @@
+ package com.nova.micfx.audio
+ 
++/** A voice preset. [id] is a stable identifier (never the display name). */
+ data class Preset(val id: String, val name: String, val description: String, val params: EffectParams)
+ 
+ object Presets {
+-    val NATURAL = Preset("natural", "Natural", "Neutral. Only the safe default high-pass filter and limiter.", EffectParams())
++    const val CUSTOM_ID = "custom"
++
++    val NATURAL = Preset("natural", "Natural Voice", "Neutral. Only the safe high-pass filter and limiter.", EffectParams())
+ 
+-    val GAMING = Preset(
+-        "gaming", "Gaming",
+-        "Voice boost with noise suppressor and gate, slight presence lift.",
+-        EffectParams(
+-            inputGainDb = 6f, highPassEnabled = true,
+-            noiseReductionEnabled = true, noiseReductionStrength = 0.6f,
+-            gateEnabled = true, gateThresholdDb = -50f,
+-            midDb = 3f, trebleDb = 2f
+-        )
+-    )
+     val CLEAR_VOICE = Preset(
+-        "clear", "Clear Voice",
++        "clean", "Clean Voice",
+         "Light gain, gentle noise suppression, presence and treble for intelligibility.",
+         EffectParams(
+             inputGainDb = 3f, noiseReductionEnabled = true, noiseReductionStrength = 0.4f,
+@@ -31,13 +24,25 @@ object Presets {
+             bassDb = 3f, voiceMode = VoiceMode.DEEP
+         )
+     )
+-    val NOISE_REDUCTION = Preset(
+-        "noise", "Noise Reduction",
+-        "Strong noise suppression and gate for noisy rooms.",
+-        EffectParams(
+-            inputGainDb = 6f, noiseReductionEnabled = true, noiseReductionStrength = 0.85f,
+-            gateEnabled = true, gateThresholdDb = -45f
+-        )
++    val LOW_PITCH = Preset(
++        "low_pitch", "Low Pitch",
++        "Pitch shifted down 6 semitones with a little extra bass.",
++        EffectParams(pitchSemitones = -6f, bassDb = 2f, noiseReductionEnabled = true, noiseReductionStrength = 0.3f)
++    )
++    val HIGH_PITCH = Preset(
++        "high_pitch", "High Pitch",
++        "Pitch shifted up 5 semitones with a touch of treble.",
++        EffectParams(pitchSemitones = 5f, trebleDb = 2f, noiseReductionEnabled = true, noiseReductionStrength = 0.3f)
++    )
++    val ROBOT = Preset(
++        "robot", "Robot",
++        "Metallic ring-modulated voice (50 Hz carrier).",
++        EffectParams(voiceMode = VoiceMode.ROBOT, inputGainDb = 3f)
++    )
++    val ALIEN = Preset(
++        "alien", "Alien",
++        "Pitch up 3 semitones, 200 Hz ring modulation and a little reverb.",
++        EffectParams(voiceMode = VoiceMode.ALIEN, reverbEnabled = true, reverbRoom = 0.4f, reverbMix = 0.2f)
+     )
+     val RADIO = Preset(
+         "radio", "Radio",
+@@ -47,22 +52,67 @@ object Presets {
+             trebleDb = 2f, voiceMode = VoiceMode.RADIO
+         )
+     )
++    val ECHO = Preset(
++        "echo", "Echo",
++        "Audible echo: 300 ms delay, damped feedback.",
++        EffectParams(echoEnabled = true, echoDelayMs = 300f, echoFeedback = 0.4f, echoMix = 0.4f)
++    )
++    val REVERB = Preset(
++        "reverb", "Reverb",
++        "Large room reverb.",
++        EffectParams(reverbEnabled = true, reverbRoom = 0.75f, reverbMix = 0.35f)
++    )
++    val GAMING = Preset(
++        "gaming", "Gaming",
++        "Voice boost with noise suppressor and gate, slight presence lift.",
++        EffectParams(
++            inputGainDb = 6f, noiseReductionEnabled = true, noiseReductionStrength = 0.6f,
++            gateEnabled = true, gateThresholdDb = -50f, midDb = 3f, trebleDb = 2f
++        )
++    )
++    val NOISE_REDUCTION = Preset(
++        "noise", "Noise Reduction",
++        "Strong noise suppression and gate for noisy rooms.",
++        EffectParams(
++            inputGainDb = 6f, noiseReductionEnabled = true, noiseReductionStrength = 0.85f,
++            gateEnabled = true, gateThresholdDb = -45f
++        )
++    )
++    val BRIGHT = Preset("bright", "Bright Voice", "Pitch up 2 semitones with presence boost.", EffectParams(voiceMode = VoiceMode.BRIGHT))
++    val WARM = Preset("warm", "Warm Voice", "Fuller lows and softer highs (EQ only).", EffectParams(voiceMode = VoiceMode.WARM))
++    val TELEPHONE = Preset("telephone", "Telephone", "Narrow-band telephone sound.", EffectParams(voiceMode = VoiceMode.TELEPHONE, inputGainDb = 3f))
+ 
+-    val builtIn: List<Preset> = listOf(NATURAL, GAMING, CLEAR_VOICE, DEEP_VOICE, NOISE_REDUCTION, RADIO)
++    val builtIn: List<Preset> = listOf(
++        NATURAL, CLEAR_VOICE, DEEP_VOICE, LOW_PITCH, HIGH_PITCH, ROBOT, ALIEN, RADIO, ECHO, REVERB,
++        GAMING, NOISE_REDUCTION, BRIGHT, WARM, TELEPHONE
++    )
++
++    fun byId(id: String?): Preset? = builtIn.firstOrNull { it.id == id }
++
++    /** Case-insensitive search over name and description. */
++    fun search(query: String, list: List<Preset> = builtIn): List<Preset> {
++        val q = query.trim().lowercase()
++        if (q.isEmpty()) return list
++        return list.filter { it.name.lowercase().contains(q) || it.description.lowercase().contains(q) || it.id.contains(q) }
++    }
+ 
+     /** Applies a preset: returns validated parameters that the engine will really use. */
+     fun apply(preset: Preset): EffectParams = preset.params.copy(bypass = false).validated()
++
++    /** The preset whose parameters equal [params], if any (used to restore the selected-preset indicator). */
++    fun matching(params: EffectParams): Preset? = builtIn.firstOrNull { apply(it) == params.validated() }
+ }
+ 
+ /** Text codec used to store the Custom preset and last-used settings locally. */
+ object ParamsCodec {
+     fun encode(p: EffectParams): String = listOf(
+         "bypass" to p.bypass, "inputGainDb" to p.inputGainDb, "outputVolume" to p.outputVolume,
++        "dryWet" to p.dryWet, "limiterCeilingDb" to p.limiterCeilingDb,
+         "highPassEnabled" to p.highPassEnabled,
+         "noiseReductionEnabled" to p.noiseReductionEnabled, "noiseReductionStrength" to p.noiseReductionStrength,
+         "gateEnabled" to p.gateEnabled, "gateThresholdDb" to p.gateThresholdDb,
+         "bassDb" to p.bassDb, "midDb" to p.midDb, "trebleDb" to p.trebleDb,
+-        "voiceMode" to p.voiceMode.name, "customPitchSemitones" to p.customPitchSemitones,
++        "voiceMode" to p.voiceMode.name, "pitchSemitones" to p.pitchSemitones,
+         "echoEnabled" to p.echoEnabled, "echoDelayMs" to p.echoDelayMs,
+         "echoFeedback" to p.echoFeedback, "echoMix" to p.echoMix,
+         "reverbEnabled" to p.reverbEnabled, "reverbRoom" to p.reverbRoom, "reverbMix" to p.reverbMix
+@@ -82,6 +132,8 @@ object ParamsCodec {
+             bypass = b("bypass", d.bypass),
+             inputGainDb = f("inputGainDb", d.inputGainDb),
+             outputVolume = f("outputVolume", d.outputVolume),
++            dryWet = f("dryWet", d.dryWet),
++            limiterCeilingDb = f("limiterCeilingDb", d.limiterCeilingDb),
+             highPassEnabled = b("highPassEnabled", d.highPassEnabled),
+             noiseReductionEnabled = b("noiseReductionEnabled", d.noiseReductionEnabled),
+             noiseReductionStrength = f("noiseReductionStrength", d.noiseReductionStrength),
+@@ -91,7 +143,7 @@ object ParamsCodec {
+             midDb = f("midDb", d.midDb),
+             trebleDb = f("trebleDb", d.trebleDb),
+             voiceMode = VoiceMode.values().firstOrNull { it.name == m["voiceMode"] } ?: d.voiceMode,
+-            customPitchSemitones = f("customPitchSemitones", d.customPitchSemitones),
++            pitchSemitones = f("pitchSemitones", d.pitchSemitones),
+             echoEnabled = b("echoEnabled", d.echoEnabled),
+             echoDelayMs = f("echoDelayMs", d.echoDelayMs),
+             echoFeedback = f("echoFeedback", d.echoFeedback),
+diff --git a/app/src/main/java/com/nova/micfx/settings/AudioSettingsRepository.kt b/app/src/main/java/com/nova/micfx/settings/AudioSettingsRepository.kt
+index deb7f1d..660d276 100644
+--- a/app/src/main/java/com/nova/micfx/settings/AudioSettingsRepository.kt
++++ b/app/src/main/java/com/nova/micfx/settings/AudioSettingsRepository.kt
+@@ -4,6 +4,7 @@ import android.content.Context
+ import com.nova.micfx.audio.EffectParams
+ import com.nova.micfx.audio.EngineSettings
+ import com.nova.micfx.audio.ParamsCodec
++import com.nova.micfx.audio.SettingsCodec
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ 
+@@ -11,41 +12,30 @@ import kotlinx.coroutines.flow.StateFlow
+ class AudioSettingsRepository(context: Context) {
+     private val prefs = context.applicationContext.getSharedPreferences("nova_mic_fx", Context.MODE_PRIVATE)
+ 
+-    private val _settings = MutableStateFlow(load())
++    private val _settings = MutableStateFlow(SettingsCodec.decode(prefs.getString("engineSettings", null)))
+     val settings: StateFlow<EngineSettings> = _settings
+ 
+-    private fun load(): EngineSettings = EngineSettings(
+-        preferredSampleRate = prefs.getInt("sampleRate", 0),
+-        bufferMultiplier = prefs.getInt("bufferMult", 2).coerceIn(1, 4),
+-        preferredInputId = prefs.getInt("inId", -1),
+-        preferredOutputId = prefs.getInt("outId", -1),
+-        allowSpeakerMonitoring = prefs.getBoolean("allowSpeaker", false),
+-        runInBackground = prefs.getBoolean("background", false),
+-        useCommunicationSource = prefs.getBoolean("commSource", false),
+-        requestSystemNs = prefs.getBoolean("sysNs", false),
+-        requestSystemAec = prefs.getBoolean("sysAec", false),
+-        requestSystemAgc = prefs.getBoolean("sysAgc", false)
+-    )
+-
+     fun update(transform: (EngineSettings) -> EngineSettings) {
+-        val s = transform(_settings.value)
++        val s = transform(_settings.value).validated()
+         _settings.value = s
+-        prefs.edit()
+-            .putInt("sampleRate", s.preferredSampleRate)
+-            .putInt("bufferMult", s.bufferMultiplier.coerceIn(1, 4))
+-            .putInt("inId", s.preferredInputId)
+-            .putInt("outId", s.preferredOutputId)
+-            .putBoolean("allowSpeaker", s.allowSpeakerMonitoring)
+-            .putBoolean("background", s.runInBackground)
+-            .putBoolean("commSource", s.useCommunicationSource)
+-            .putBoolean("sysNs", s.requestSystemNs)
+-            .putBoolean("sysAec", s.requestSystemAec)
+-            .putBoolean("sysAgc", s.requestSystemAgc)
+-            .apply()
++        prefs.edit().putString("engineSettings", SettingsCodec.encode(s)).apply()
++    }
++
++    fun resetSettings() {
++        _settings.value = EngineSettings()
++        prefs.edit().remove("engineSettings").apply()
+     }
+ 
+-    fun saveCustomPreset(p: EffectParams) { prefs.edit().putString("customPreset", ParamsCodec.encode(p)).apply() }
++    /** @return true only if the data was really written to storage. */
++    fun saveCustomPreset(p: EffectParams): Boolean =
++        prefs.edit().putString("customPreset", ParamsCodec.encode(p)).commit()
++
+     fun loadCustomPreset(): EffectParams? = prefs.getString("customPreset", null)?.let { ParamsCodec.decode(it) }
+-    fun saveLastParams(p: EffectParams) { prefs.edit().putString("lastParams", ParamsCodec.encode(p)).apply() }
++
++    fun saveLast(p: EffectParams, presetId: String?) {
++        prefs.edit().putString("lastParams", ParamsCodec.encode(p)).putString("lastPreset", presetId).apply()
++    }
++
+     fun loadLastParams(): EffectParams = ParamsCodec.decode(prefs.getString("lastParams", null))
++    fun loadLastPresetId(): String? = prefs.getString("lastPreset", null)
+ }
+diff --git a/app/src/main/java/com/nova/micfx/ui/MainActivity.kt b/app/src/main/java/com/nova/micfx/ui/MainActivity.kt
+index e4a9fd1..aec03ff 100644
+--- a/app/src/main/java/com/nova/micfx/ui/MainActivity.kt
++++ b/app/src/main/java/com/nova/micfx/ui/MainActivity.kt
+@@ -9,12 +9,21 @@ import android.provider.Settings
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.rememberLauncherForActivityResult
+ import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
+ import androidx.activity.result.contract.ActivityResultContracts
+ import androidx.activity.viewModels
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.PaddingValues
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.WindowInsetsSides
++import androidx.compose.foundation.layout.displayCutout
++import androidx.compose.foundation.layout.only
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.runtime.LaunchedEffect
++import android.widget.Toast
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.material.icons.Icons
+@@ -50,8 +59,11 @@ class MainActivity : ComponentActivity() {
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
++        enableEdgeToEdge()
+         setContent {
+             NovaTheme {
++                val msg by vm.message.collectAsStateWithLifecycle()
++                LaunchedEffect(msg) { msg?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show(); vm.clearMessage() } }
+                 var tab by rememberSaveable { mutableIntStateOf(0) }
+                 var startAfterPermission by rememberSaveable { mutableIntStateOf(0) }
+                 val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+@@ -63,6 +75,7 @@ class MainActivity : ComponentActivity() {
+                     if (vm.engine.hasPermission()) vm.toggleEngine()
+                     else {
+                         startAfterPermission = 1
++                        vm.setPermissionPending(true)
+                         val perms = if (Build.VERSION.SDK_INT >= 33)
+                             arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
+                         else arrayOf(Manifest.permission.RECORD_AUDIO)
+@@ -91,6 +104,7 @@ class MainActivity : ComponentActivity() {
+                 ) { pad: PaddingValues ->
+                     Box(
+                         Modifier.fillMaxSize().padding(pad)
++                            .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
+                             .background(Brush.verticalGradient(listOf(Midnight, Color(0xFF070B1A), Midnight)))
+                     ) {
+                         when (tab) {
+diff --git a/app/src/main/java/com/nova/micfx/ui/MicFxViewModel.kt b/app/src/main/java/com/nova/micfx/ui/MicFxViewModel.kt
+index bde3892..d090ec0 100644
+--- a/app/src/main/java/com/nova/micfx/ui/MicFxViewModel.kt
++++ b/app/src/main/java/com/nova/micfx/ui/MicFxViewModel.kt
+@@ -7,18 +7,24 @@ import androidx.lifecycle.AndroidViewModel
+ import androidx.lifecycle.viewModelScope
+ import com.nova.micfx.NovaApp
+ import com.nova.micfx.audio.AudioEffectController
++import com.nova.micfx.audio.CapabilitySummary
+ import com.nova.micfx.audio.CompatItem
+ import com.nova.micfx.audio.CompatibilityChecker
++import com.nova.micfx.audio.DisplayStatus
+ import com.nova.micfx.audio.EffectParams
+-import com.nova.micfx.audio.EngineState
+ import com.nova.micfx.audio.EngineSettings
++import com.nova.micfx.audio.EngineState
+ import com.nova.micfx.audio.Preset
+ import com.nova.micfx.audio.Presets
++import com.nova.micfx.audio.StatusResolver
+ import com.nova.micfx.service.MicFxService
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.SharingStarted
+ import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+ 
+ class MicFxViewModel(app: Application) : AndroidViewModel(app) {
+@@ -33,17 +39,42 @@ class MicFxViewModel(app: Application) : AndroidViewModel(app) {
+     val outputDevices = engine.devices.outputs
+ 
+     val permissionGranted = MutableStateFlow(engine.hasPermission())
++    val permissionPending = MutableStateFlow(false)
+     val permissionAsked = MutableStateFlow(false)
+     val compat = MutableStateFlow<List<CompatItem>>(emptyList())
++    val capability = MutableStateFlow<CapabilitySummary?>(null)
++    val supportedRates = MutableStateFlow<List<Int>>(emptyList())
+     val checklist = MutableStateFlow<Set<Int>>(emptySet())
+     val customPreset = MutableStateFlow(repo.loadCustomPreset())
+-    val activePresetId = MutableStateFlow<String?>(null)
++    val activePresetId = MutableStateFlow<String?>(restorePresetId())
++    val message = MutableStateFlow<String?>(null)
+     val systemEffects = AudioEffectController.availability()
+ 
++    val displayStatus: StateFlow<DisplayStatus> = combine(snapshot, permissionGranted, permissionPending) { s, g, pending ->
++        StatusResolver.resolve(s, g, pending)
++    }.stateIn(viewModelScope, SharingStarted.Eagerly, DisplayStatus.READY)
++
+     private var saveJob: Job? = null
+ 
++    private fun restorePresetId(): String? {
++        val id = repo.loadLastPresetId() ?: return null
++        val current = engine.params.value
++        return when {
++            id == Presets.CUSTOM_ID && repo.loadCustomPreset() == current -> id
++            Presets.byId(id)?.let { Presets.apply(it) == current } == true -> id
++            else -> null
++        }
++    }
++
++    fun presetName(id: String?): String = when (id) {
++        null -> "Modified (custom settings)"
++        Presets.CUSTOM_ID -> "Custom"
++        else -> Presets.byId(id)?.name ?: "Modified (custom settings)"
++    }
++
+     fun refreshPermission() { permissionGranted.value = engine.hasPermission() }
+-    fun onPermissionResult() { permissionAsked.value = true; refreshPermission() }
++    fun setPermissionPending(pending: Boolean) { permissionPending.value = pending }
++    fun onPermissionResult() { permissionPending.value = false; permissionAsked.value = true; refreshPermission() }
+ 
+     fun startEngine() {
+         refreshPermission()
+@@ -56,7 +87,7 @@ class MicFxViewModel(app: Application) : AndroidViewModel(app) {
+ 
+     fun toggleEngine() {
+         val s = snapshot.value.state
+-        if (s == EngineState.RUNNING || s == EngineState.STARTING) stopEngine() else startEngine()
++        if (s == EngineState.RUNNING || s == EngineState.STARTING || s == EngineState.RECOVERING) stopEngine() else startEngine()
+     }
+ 
+     fun update(transform: (EffectParams) -> EffectParams) {
+@@ -71,22 +102,42 @@ class MicFxViewModel(app: Application) : AndroidViewModel(app) {
+ 
+     fun saveCustom() {
+         val p = params.value
+-        repo.saveCustomPreset(p); customPreset.value = p
++        if (repo.saveCustomPreset(p)) {
++            customPreset.value = p
++            activePresetId.value = Presets.CUSTOM_ID
++            scheduleSave()
++            message.value = "Custom preset saved on this device."
++        } else {
++            message.value = "Could not save the custom preset (storage error)."
++        }
+     }
+ 
+     fun applyCustom() {
+-        customPreset.value?.let { engine.setParams(it); activePresetId.value = "custom"; scheduleSave() }
++        val c = customPreset.value
++        if (c == null) { message.value = "No custom preset has been saved yet."; return }
++        engine.setParams(c); activePresetId.value = Presets.CUSTOM_ID; scheduleSave()
++        message.value = "Custom preset restored."
++    }
++
++    fun resetEffects() {
++        engine.updateParams { it.resetEffects() }; activePresetId.value = null; scheduleSave()
+     }
+ 
+     fun resetControls() {
+         engine.setParams(EffectParams()); activePresetId.value = Presets.NATURAL.id; scheduleSave()
+     }
+ 
++    fun clearMessage() { message.value = null }
++
+     fun updateSettings(t: (EngineSettings) -> EngineSettings) = repo.update(t)
++    fun resetSettings() { repo.resetSettings(); message.value = "Settings reset to defaults." }
+ 
+     fun runCompat() {
+         engine.devices.refresh()
+-        compat.value = CompatibilityChecker(getApplication(), engine.devices).run()
++        val checker = CompatibilityChecker(getApplication(), engine.devices)
++        compat.value = checker.run()
++        capability.value = checker.summary()
++        supportedRates.value = checker.supportedSampleRates()
+     }
+ 
+     fun toggleChecklist(i: Int) {
+@@ -100,6 +151,6 @@ class MicFxViewModel(app: Application) : AndroidViewModel(app) {
+ 
+     private fun scheduleSave() {
+         saveJob?.cancel()
+-        saveJob = viewModelScope.launch { delay(600); repo.saveLastParams(engine.params.value) }
++        saveJob = viewModelScope.launch { delay(600); repo.saveLast(engine.params.value, activePresetId.value) }
+     }
+ }
+diff --git a/app/src/main/java/com/nova/micfx/ui/components/Components.kt b/app/src/main/java/com/nova/micfx/ui/components/Components.kt
+index 3a4cd33..c9c392c 100644
+--- a/app/src/main/java/com/nova/micfx/ui/components/Components.kt
++++ b/app/src/main/java/com/nova/micfx/ui/components/Components.kt
+@@ -4,6 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
+ import androidx.compose.animation.core.tween
+ import androidx.compose.foundation.BorderStroke
+ import androidx.compose.foundation.Canvas
++import androidx.compose.foundation.background
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+@@ -23,6 +24,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.geometry.CornerRadius
+ import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.geometry.Size
+@@ -33,6 +35,7 @@ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import com.nova.micfx.audio.DspMath
+ import com.nova.micfx.ui.theme.Danger
++import com.nova.micfx.ui.theme.Good
+ import com.nova.micfx.ui.theme.ElectricBlue
+ import com.nova.micfx.ui.theme.Navy
+ import com.nova.micfx.ui.theme.NavyLight
+@@ -122,3 +125,35 @@ fun StatusChip(text: String, color: Color) {
+         modifier = Modifier.padding(end = 6.dp)
+     )
+ }
++
++
++/** Small rounded status label. */
++@Composable
++fun StatusPill(text: String, color: Color) {
++    Box(Modifier.clip(RoundedCornerShape(50)).background(color.copy(alpha = 0.18f)).padding(horizontal = 10.dp, vertical = 4.dp)) {
++        Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
++    }
++}
++
++/** Shows the REAL processing state of an effect: ACTIVE only when enabled and the engine is running. */
++@Composable
++fun EffectTag(enabled: Boolean, running: Boolean) {
++    when {
++        !enabled -> StatusPill("OFF", TextDim)
++        running -> StatusPill("ACTIVE", Good)
++        else -> StatusPill("READY", Warn)
++    }
++}
++
++/** Effect card: name, description, state tag, then the controls. */
++@Composable
++fun EffectCard(title: String, description: String, enabled: Boolean, running: Boolean, content: @Composable ColumnScope.() -> Unit) {
++    GlassCard {
++        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
++            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
++            EffectTag(enabled, running)
++        }
++        Dim(description)
++        content()
++    }
++}
+diff --git a/app/src/main/java/com/nova/micfx/ui/screens/CompatibilityScreen.kt b/app/src/main/java/com/nova/micfx/ui/screens/CompatibilityScreen.kt
+index f39e454..58d47bd 100644
+--- a/app/src/main/java/com/nova/micfx/ui/screens/CompatibilityScreen.kt
++++ b/app/src/main/java/com/nova/micfx/ui/screens/CompatibilityScreen.kt
+@@ -1,9 +1,9 @@
+ package com.nova.micfx.ui.screens
+ 
++import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxWidth
+-import androidx.compose.foundation.clickable
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.Checkbox
+ import androidx.compose.material3.Text
+@@ -12,8 +12,12 @@ import androidx.compose.runtime.LaunchedEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import android.os.Build
++import com.nova.micfx.audio.CompatItem
+ import com.nova.micfx.audio.CompatStatus
++import com.nova.micfx.audio.EngineState
+ import com.nova.micfx.ui.MicFxViewModel
+ import com.nova.micfx.ui.components.Dim
+ import com.nova.micfx.ui.components.GlassCard
+@@ -25,37 +29,92 @@ import com.nova.micfx.ui.theme.Warn
+ 
+ private val CHECKLIST = listOf(
+     "Headphones are connected and the volume is low",
+-    "The target app/game has microphone permission",
+-    "The target app uses the phone microphone (not a separate USB/Bluetooth mic)",
++    "The voice-chat app has microphone permission",
++    "I tried the voice-chat app's own voice effects / noise suppression",
+     "I tested by recording in the target app and listening back",
+     "I understand NOVA MIC FX output is NOT sent into the target app"
+ )
+ 
++private fun color(s: CompatStatus): Color = when (s) {
++    CompatStatus.OK -> Good; CompatStatus.WARN -> Warn; CompatStatus.NO -> Danger; CompatStatus.INFO -> Cyan
++}
++
++@Composable
++private fun ItemCard(it: CompatItem) {
++    GlassCard {
++        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++            Text(it.title, modifier = Modifier.weight(1f))
++            Text(it.status.name, color = color(it.status))
++        }
++        Dim(it.detail)
++    }
++}
++
+ @Composable
+ fun CompatibilityScreen(vm: MicFxViewModel) {
+     val items by vm.compat.collectAsStateWithLifecycle()
++    val cap by vm.capability.collectAsStateWithLifecycle()
+     val checked by vm.checklist.collectAsStateWithLifecycle()
+     val granted by vm.permissionGranted.collectAsStateWithLifecycle()
++    val snap by vm.snapshot.collectAsStateWithLifecycle()
++    val status by vm.displayStatus.collectAsStateWithLifecycle()
++    val ins by vm.inputDevices.collectAsStateWithLifecycle()
++    val outs by vm.outputDevices.collectAsStateWithLifecycle()
++    val settings by vm.settings.collectAsStateWithLifecycle()
++    val rates by vm.supportedRates.collectAsStateWithLifecycle()
+     LaunchedEffect(granted) { vm.runCompat() }
+ 
+     ScreenScaffold {
+-        SectionTitle("Device and game compatibility")
++        SectionTitle("Compatibility and diagnostics")
++
++        cap?.let {
++            Dim("Four different things. A success in one never implies another:")
++            ItemCard(it.processingInsideNova); ItemCard(it.localMonitoring); ItemCard(it.externalHardware); ItemCard(it.directInjection)
++        }
++
+         GlassCard {
+-            Text("Important Android limitation", color = Danger)
+-            Dim("A normal Android app cannot replace the microphone input of a game, Discord or a phone call. " +
+-                "Audio processed inside NOVA MIC FX stays inside NOVA MIC FX. External-app compatibility is therefore always reported as NOT SUPPORTED here.")
++            Text("Free Fire, WePlay and other voice-chat apps", color = Danger)
++            Dim("Status: NOT SUPPORTED / NOT VERIFIED. Android isolates every app's microphone. Audio played by NOVA never becomes another app's microphone input, " +
++                "and successfully opening AudioRecord or AudioTrack proves nothing about third-party apps. NOVA does not use root, AudioPlaybackCapture, accessibility or overlays for this.")
++            Dim("Practical alternatives: (1) use the voice-chat app's own voice effects and noise suppression; (2) a USB audio interface or hardware voice changer, " +
++                "device- and app-dependent; (3) on a PC, a virtual audio cable. NOVA remains useful as a live headphone voice-effects monitor.")
+         }
+-        items.forEach {
+-            GlassCard {
+-                val c = when (it.status) { CompatStatus.OK -> Good; CompatStatus.WARN -> Warn; CompatStatus.NO -> Danger; CompatStatus.INFO -> Cyan }
+-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+-                    Text(it.title)
+-                    Text(it.status.name, color = c)
+-                }
+-                Dim(it.detail)
+-            }
++
++        GlassCard {
++            SectionTitle("Engine and route")
++            Dim("Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})")
++            Dim("Engine status: ${status.label} (${snap.state.name})")
++            Dim("Selected input: " + (ins.firstOrNull { it.id == settings.preferredInputId }?.name ?: "system default"))
++            Dim("Selected output: " + (outs.firstOrNull { it.id == settings.preferredOutputId }?.name ?: "system default"))
++            if (snap.state == EngineState.RUNNING) {
++                Dim("Active input route: ${snap.inputDevice}")
++                Dim("Active output route: ${snap.outputDevice}")
++                Dim("Route verified as headphone-safe: ${if (snap.outputVerifiedSafe) "yes" else "no"}")
++            } else Dim("Active route: not monitoring (nothing to verify)")
++            Dim("Supported sample rates: " + if (rates.isEmpty()) "none found" else rates.joinToString(", ") { "$it Hz" })
++        }
++
++        GlassCard {
++            SectionTitle("Available input devices")
++            if (ins.isEmpty()) Dim("None reported.")
++            ins.forEach { Dim("${it.name}  [id ${it.id}]" + if (it.id == settings.preferredInputId) "  (preferred)" else "") }
++            SectionTitle("Available output devices")
++            if (outs.isEmpty()) Dim("None reported.")
++            outs.forEach { Dim("${it.name}  [id ${it.id}]" + (if (it.headphoneLike) "  (headphone-safe)" else "") + if (it.id == settings.preferredOutputId) "  (preferred)" else "") }
+         }
++
++        items.forEach { ItemCard(it) }
+         Button(onClick = { vm.runCompat() }) { Text("Re-check") }
++
++        GlassCard {
++            SectionTitle("Known limitations")
++            Dim("Android 10+ may silence the microphone for apps in the background. Manufacturers may stop background services. " +
++                "Bluetooth adds 100+ ms delay. Pitch shifting adds ~20 ms and can sound artificial on fast speech. Latency shown is measured buffering only, not hardware delay.")
++            SectionTitle("Troubleshooting")
++            Dim("No sound: connect headphones and raise output volume. Microphone Busy: close calls/recorders/games. Crackling: increase buffer size in Settings. " +
++                "Route blocked: use headphones or allow speaker monitoring (feedback risk). Silent input: keep NOVA in the foreground and check permission.")
++        }
++
+         GlassCard {
+             SectionTitle("Manual checklist")
+             CHECKLIST.forEachIndexed { i, t ->
+@@ -64,7 +123,7 @@ fun CompatibilityScreen(vm: MicFxViewModel) {
+                     Text(t)
+                 }
+             }
+-            Dim("This checklist is a personal reminder only. It does not verify anything automatically.")
++            Dim("A personal reminder only. It does not verify anything automatically. Physical-hardware behavior must be tested by hand.")
+         }
+     }
+ }
+diff --git a/app/src/main/java/com/nova/micfx/ui/screens/EffectsScreen.kt b/app/src/main/java/com/nova/micfx/ui/screens/EffectsScreen.kt
+index e8e4f74..f5c8850 100644
+--- a/app/src/main/java/com/nova/micfx/ui/screens/EffectsScreen.kt
++++ b/app/src/main/java/com/nova/micfx/ui/screens/EffectsScreen.kt
+@@ -8,9 +8,10 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.nova.micfx.audio.EngineState
+ import com.nova.micfx.audio.Limits
+ import com.nova.micfx.audio.VoiceMode
++import com.nova.micfx.audio.VoiceProfile
+ import com.nova.micfx.ui.MicFxViewModel
+ import com.nova.micfx.ui.components.Dim
+-import com.nova.micfx.ui.components.GlassCard
++import com.nova.micfx.ui.components.EffectCard
+ import com.nova.micfx.ui.components.LabeledSlider
+ import com.nova.micfx.ui.components.SectionTitle
+ import com.nova.micfx.ui.components.ToggleRow
+@@ -19,85 +20,87 @@ import com.nova.micfx.ui.components.ToggleRow
+ fun EffectsScreen(vm: MicFxViewModel) {
+     val p by vm.params.collectAsStateWithLifecycle()
+     val snap by vm.snapshot.collectAsStateWithLifecycle()
+-    val s by vm.settings.collectAsStateWithLifecycle()
+     val running = snap.state == EngineState.RUNNING
++    val m = snap.meters
+     val tone = -Limits.TONE_MAX_DB..Limits.TONE_MAX_DB
++    val fx = !p.bypass
+ 
+     ScreenScaffold {
+         SectionTitle("Effects")
+-        Dim("All effects process the app's own monitoring output only. They are not sent to other apps.")
++        Dim("All effects process NOVA's own monitoring output only. They are not sent to other apps. Changes apply instantly without restarting audio.")
+ 
+-        GlassCard {
+-            SectionTitle("Gain and output")
++        EffectCard("Input gain and output", "Software gain on captured samples and the monitoring volume. A peak limiter always protects the output.", true, running) {
+             LabeledSlider("Mic gain (software)", "%+.0f dB".format(p.inputGainDb), p.inputGainDb,
+                 Limits.GAIN_MIN_DB..Limits.GAIN_MAX_DB, { v -> vm.update { it.copy(inputGainDb = v) } })
+-            LabeledSlider("Monitor volume", "${(p.outputVolume * 100).toInt()}%", p.outputVolume,
++            LabeledSlider("Output gain", "${(p.outputVolume * 100).toInt()}%", p.outputVolume,
+                 0f..Limits.VOLUME_MAX, { v -> vm.update { it.copy(outputVolume = v) } })
++            LabeledSlider("Limiter ceiling", "%.1f dB".format(p.limiterCeilingDb), p.limiterCeilingDb,
++                Limits.LIMITER_MIN_DB..Limits.LIMITER_MAX_DB, { v -> vm.update { it.copy(limiterCeilingDb = v) } })
++            if (running) Dim("Limiter reduction now: %.1f dB".format(m.limiterReductionDb))
+             ToggleRow("High-pass filter (80 Hz)", "Removes rumble and handling noise", p.highPassEnabled) { on -> vm.update { it.copy(highPassEnabled = on) } }
+-            Dim("A peak limiter is always active so output never exceeds about -0.3 dBFS. Gain changes are smoothed.")
+         }
+ 
+-        GlassCard {
+-            SectionTitle("Noise reduction")
+-            ToggleRow("Adaptive noise suppressor", "Reduces steady background noise between speech. Not AI noise cancellation.",
+-                p.noiseReductionEnabled) { on -> vm.update { it.copy(noiseReductionEnabled = on) } }
++        EffectCard("Pitch", "Real duration-preserving pitch shifting (adds about 20 ms delay). Adds to the voice character below.",
++            fx && VoiceProfile.totalPitch(p) != 0f, running) {
++            LabeledSlider("Pitch", "%+.0f semitones".format(p.pitchSemitones), p.pitchSemitones,
++                -Limits.PITCH_MAX_ST..Limits.PITCH_MAX_ST, { v -> vm.update { it.copy(pitchSemitones = Math.round(v).toFloat()) } })
++            Dim("Total applied now: %+.0f semitones".format(VoiceProfile.totalPitch(p)))
++        }
++
++        EffectCard("Voice character", "Filter, EQ, pitch and modulation profile. " + p.voiceMode.description,
++            fx && p.voiceMode != VoiceMode.NATURAL && p.voiceMode != VoiceMode.CUSTOM, running) {
++            ChipRow(VoiceMode.values().map { it.label to it }, { it == p.voiceMode }) { mode -> vm.update { it.copy(voiceMode = mode) } }
++        }
++
++        EffectCard("Noise reduction", "Adaptive suppressor reduces steady noise between speech. Not AI noise cancellation.",
++            fx && (p.noiseReductionEnabled || p.gateEnabled), running) {
++            ToggleRow("Noise suppressor", "Strength sets the maximum reduction (up to 24 dB)", p.noiseReductionEnabled) { on -> vm.update { it.copy(noiseReductionEnabled = on) } }
+             LabeledSlider("Strength", "${(p.noiseReductionStrength * 100).toInt()}%", p.noiseReductionStrength,
+                 0f..1f, { v -> vm.update { it.copy(noiseReductionStrength = v) } }, enabled = p.noiseReductionEnabled)
+             ToggleRow("Noise gate", "Silences audio below the threshold", p.gateEnabled) { on -> vm.update { it.copy(gateEnabled = on) } }
+             LabeledSlider("Gate threshold", "%.0f dB".format(p.gateThresholdDb), p.gateThresholdDb,
+                 Limits.GATE_MIN_DB..Limits.GATE_MAX_DB, { v -> vm.update { it.copy(gateThresholdDb = v) } }, enabled = p.gateEnabled)
+-            if (running) Dim("Measured: noise floor %.0f dB, suppression %.1f dB, voice ${if (snap.meters.voiceActive) "detected" else "not detected"}"
+-                .format(snap.meters.noiseFloorDb, snap.meters.reductionDb))
++            if (running) Dim("Measured: noise floor %.0f dB, reduction %.1f dB, voice ${if (m.voiceActive) "detected" else "not detected"}".format(m.noiseFloorDb, m.reductionDb))
+             Dim("System noise suppressor: " + (if (!vm.systemEffects.noiseSuppressor) "not available on this device"
+-                else if (running) (if (snap.systemNsActive) "ACTIVE" else "available, not enabled (turn on in Settings)") else "available (enable in Settings)"))
++                else if (running) (if (snap.systemNsActive) "ACTIVE" else "available, not enabled (Settings)") else "available (enable in Settings)"))
+             Dim("System echo canceler: " + (if (!vm.systemEffects.echoCanceler) "not available on this device"
+                 else if (running) (if (snap.systemAecActive) "ACTIVE" else "available, not enabled (Settings)") else "available (Settings)"))
+         }
+ 
+-        GlassCard {
+-            SectionTitle("Tone")
+-            LabeledSlider("Bass (120 Hz shelf)", "%+.0f dB".format(p.bassDb), p.bassDb, tone, { v -> vm.update { it.copy(bassDb = v) } })
+-            LabeledSlider("Voice presence (2.5 kHz)", "%+.0f dB".format(p.midDb), p.midDb, tone, { v -> vm.update { it.copy(midDb = v) } })
+-            LabeledSlider("Treble (6 kHz shelf)", "%+.0f dB".format(p.trebleDb), p.trebleDb, tone, { v -> vm.update { it.copy(trebleDb = v) } })
++        EffectCard("Equalizer", "Bass (120 Hz shelf), voice presence (2.5 kHz) and treble (6 kHz shelf) biquad filters.",
++            fx && (p.bassDb != 0f || p.midDb != 0f || p.trebleDb != 0f), running) {
++            LabeledSlider("Bass", "%+.0f dB".format(p.bassDb), p.bassDb, tone, { v -> vm.update { it.copy(bassDb = v) } })
++            LabeledSlider("Voice presence", "%+.0f dB".format(p.midDb), p.midDb, tone, { v -> vm.update { it.copy(midDb = v) } })
++            LabeledSlider("Treble", "%+.0f dB".format(p.trebleDb), p.trebleDb, tone, { v -> vm.update { it.copy(trebleDb = v) } })
+             Button(onClick = { vm.update { it.copy(bassDb = 0f, midDb = 0f, trebleDb = 0f) } }) { Text("Neutral") }
+         }
+ 
+-        GlassCard {
+-            SectionTitle("Voice changer")
+-            ChipRow(VoiceMode.values().map { it.label to it }, { it == p.voiceMode }) { mode -> vm.update { it.copy(voiceMode = mode) } }
+-            Dim(p.voiceMode.description)
+-            if (p.voiceMode == VoiceMode.CUSTOM) {
+-                LabeledSlider("Pitch shift", "%+.0f semitones".format(p.customPitchSemitones), p.customPitchSemitones,
+-                    -Limits.PITCH_MAX_ST..Limits.PITCH_MAX_ST, { v -> vm.update { it.copy(customPitchSemitones = Math.round(v).toFloat()) } })
+-            }
+-            Dim("Pitch shifting adds roughly 20 ms of delay and some artifacts on fast speech.")
+-        }
+-
+-        GlassCard {
+-            SectionTitle("Echo effect")
+-            Dim("This adds an audible echo. It is different from acoustic echo cancellation.")
+-            ToggleRow("Echo", "Delay line with damped feedback", p.echoEnabled) { on -> vm.update { it.copy(echoEnabled = on) } }
++        EffectCard("Echo", "Audible echo effect. This is different from acoustic echo cancellation.", fx && p.echoEnabled, running) {
++            ToggleRow("Echo", "Delay line with damped feedback (cannot run away)", p.echoEnabled) { on -> vm.update { it.copy(echoEnabled = on) } }
+             LabeledSlider("Delay", "${p.echoDelayMs.toInt()} ms", p.echoDelayMs, Limits.ECHO_DELAY_MIN_MS..Limits.ECHO_DELAY_MAX_MS,
+                 { v -> vm.update { it.copy(echoDelayMs = v) } }, enabled = p.echoEnabled)
+             LabeledSlider("Feedback", "${(p.echoFeedback * 100).toInt()}%", p.echoFeedback, 0f..Limits.ECHO_FEEDBACK_MAX,
+                 { v -> vm.update { it.copy(echoFeedback = v) } }, enabled = p.echoEnabled)
+-            LabeledSlider("Wet level", "${(p.echoMix * 100).toInt()}%", p.echoMix, 0f..1f,
++            LabeledSlider("Echo amount", "${(p.echoMix * 100).toInt()}%", p.echoMix, 0f..1f,
+                 { v -> vm.update { it.copy(echoMix = v) } }, enabled = p.echoEnabled)
+         }
+ 
+-        GlassCard {
+-            SectionTitle("Reverb")
++        EffectCard("Reverb", "Room reverb with size and amount.", fx && p.reverbEnabled, running) {
+             ToggleRow("Reverb", "Comb and all-pass reverb", p.reverbEnabled) { on -> vm.update { it.copy(reverbEnabled = on) } }
+             LabeledSlider("Room size", "${(p.reverbRoom * 100).toInt()}%", p.reverbRoom, 0f..1f,
+                 { v -> vm.update { it.copy(reverbRoom = v) } }, enabled = p.reverbEnabled)
+-            LabeledSlider("Wet / dry mix", "${(p.reverbMix * 100).toInt()}%", p.reverbMix, 0f..1f,
++            LabeledSlider("Reverb amount", "${(p.reverbMix * 100).toInt()}%", p.reverbMix, 0f..1f,
+                 { v -> vm.update { it.copy(reverbMix = v) } }, enabled = p.reverbEnabled)
+         }
+ 
+-        GlassCard {
+-            ToggleRow("Bypass all effects", "Keeps gain, monitor volume and limiter", p.bypass) { on -> vm.update { it.copy(bypass = on) } }
+-            Button(onClick = { vm.resetControls() }) { Text("Reset everything") }
++        EffectCard("Dry / wet mix", "Blends your unprocessed voice with the processed voice. 100% = fully processed.", fx && p.dryWet < 0.999f, running) {
++            LabeledSlider("Processed amount", "${(p.dryWet * 100).toInt()}%", p.dryWet, 0f..1f, { v -> vm.update { it.copy(dryWet = v) } })
++            Dim("Mixing the dry voice with a pitch-shifted voice can sound phasey; keep 100% for strong pitch effects.")
++        }
++
++        EffectCard("Bypass", "Turns every effect off. Gain, output volume and limiter stay active.", p.bypass, running) {
++            ToggleRow("Bypass all effects", "A/B compare against your clean voice", p.bypass) { on -> vm.update { it.copy(bypass = on) } }
++            Button(onClick = { vm.resetEffects() }) { Text("Reset effects") }
+         }
+-        if (s.requestSystemAgc) Dim("System AGC requested in Settings; it may fight with the manual gain.")
+     }
+ }
+diff --git a/app/src/main/java/com/nova/micfx/ui/screens/HomeScreen.kt b/app/src/main/java/com/nova/micfx/ui/screens/HomeScreen.kt
+index 6a0ac82..83174ba 100644
+--- a/app/src/main/java/com/nova/micfx/ui/screens/HomeScreen.kt
++++ b/app/src/main/java/com/nova/micfx/ui/screens/HomeScreen.kt
+@@ -1,103 +1,142 @@
+ package com.nova.micfx.ui.screens
+ 
+-import androidx.compose.foundation.Canvas
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Box
+-import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.size
+ import androidx.compose.foundation.shape.CircleShape
+-import androidx.compose.foundation.layout.padding
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.OutlinedButton
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+-import androidx.compose.runtime.collectAsState
+ import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.draw.clip
+ import androidx.compose.ui.graphics.Brush
+ import androidx.compose.ui.graphics.Color
+-import androidx.compose.ui.graphics.drawscope.Stroke
+-import androidx.compose.ui.geometry.Size
+-import androidx.compose.ui.geometry.Offset
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.text.style.TextAlign
+ import androidx.compose.ui.unit.dp
+ import androidx.compose.ui.unit.sp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import com.nova.micfx.audio.DisplayStatus
+ import com.nova.micfx.audio.EngineState
+-import com.nova.micfx.audio.StageReport
+-import com.nova.micfx.audio.VoiceMode
+ import com.nova.micfx.audio.Limits
++import com.nova.micfx.audio.Presets
++import com.nova.micfx.audio.StageReport
++import com.nova.micfx.audio.VoiceProfile
+ import com.nova.micfx.ui.MicFxViewModel
+ import com.nova.micfx.ui.components.Dim
+ import com.nova.micfx.ui.components.GlassCard
+ import com.nova.micfx.ui.components.LabeledSlider
+ import com.nova.micfx.ui.components.LevelMeter
+ import com.nova.micfx.ui.components.SectionTitle
++import com.nova.micfx.ui.components.StatusPill
+ import com.nova.micfx.ui.components.ToggleRow
+ import com.nova.micfx.ui.theme.Danger
++import com.nova.micfx.ui.theme.DeepBlue
+ import com.nova.micfx.ui.theme.ElectricBlue
+ import com.nova.micfx.ui.theme.Good
+ import com.nova.micfx.ui.theme.TextDim
+ import com.nova.micfx.ui.theme.Violet
+ import com.nova.micfx.ui.theme.Warn
+ 
++private fun statusColor(s: DisplayStatus): Color = when (s) {
++    DisplayStatus.MONITORING -> Good
++    DisplayStatus.READY -> ElectricBlue
++    DisplayStatus.STARTING, DisplayStatus.REQUESTING_PERMISSION, DisplayStatus.RECOVERING, DisplayStatus.STOPPING -> Warn
++    else -> Danger
++}
++
++private fun recoveryHint(s: DisplayStatus): String? = when (s) {
++    DisplayStatus.PERMISSION_NEEDED -> "Allow the microphone: tap Start and accept the prompt, or open app settings."
++    DisplayStatus.MIC_BUSY -> "Close other apps that use the microphone (calls, recorders, games), then press Start."
++    DisplayStatus.UNSUPPORTED_ROUTE -> "Connect wired, USB or Bluetooth headphones, then press Start. Speaker monitoring can be allowed in Settings (feedback risk)."
++    DisplayStatus.DEVICE_DISCONNECTED -> "Reconnect the device or choose another one in Settings, then press Start."
++    DisplayStatus.ERROR -> "Press Start to retry. If it repeats, open Compat > Troubleshooting."
++    DisplayStatus.RECOVERING -> "The audio stream is restarting automatically. Monitoring resumes if it succeeds."
++    else -> null
++}
++
+ @Composable
+ fun HomeScreen(vm: MicFxViewModel, onStartStop: () -> Unit, openAppSettings: () -> Unit) {
+     val snap by vm.snapshot.collectAsStateWithLifecycle()
+     val p by vm.params.collectAsStateWithLifecycle()
++    val status by vm.displayStatus.collectAsStateWithLifecycle()
+     val granted by vm.permissionGranted.collectAsStateWithLifecycle()
+     val asked by vm.permissionAsked.collectAsStateWithLifecycle()
++    val presetId by vm.activePresetId.collectAsStateWithLifecycle()
++    val outs by vm.outputDevices.collectAsStateWithLifecycle()
+     val running = snap.state == EngineState.RUNNING
++    val active = running || snap.state == EngineState.RECOVERING
+     val busy = snap.state == EngineState.STARTING || snap.state == EngineState.STOPPING
++    val headphones = outs.any { it.headphoneLike }
+     val m = snap.meters
+ 
+     ScreenScaffold {
+         Text(
+             "NOVA MIC FX", fontSize = 30.sp, fontWeight = FontWeight.ExtraBold,
+-            style = MaterialTheme.typography.headlineMedium.copy(brush = Brush.horizontalGradient(listOf(ElectricBlue, Violet)))
++            style = MaterialTheme.typography.headlineMedium.copy(brush = Brush.horizontalGradient(listOf(ElectricBlue, DeepBlue, Violet)))
+         )
+-        Dim("Live microphone effects for headphone monitoring (Mode A). Does not feed other apps.")
++        Dim("Voice effects with live headphone monitoring. Local only: not connected to games or voice-chat apps.")
+ 
+         GlassCard {
+             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                 Box(
+                     Modifier.size(132.dp).clip(CircleShape)
+-                        .background(Brush.linearGradient(
+-                            if (running) listOf(Danger, Violet) else listOf(ElectricBlue, Violet)))
++                        .background(Brush.linearGradient(if (active) listOf(Danger, Violet) else listOf(ElectricBlue, DeepBlue, Violet)))
+                         .clickable(enabled = !busy) { onStartStop() },
+                     contentAlignment = Alignment.Center
+                 ) {
+                     Text(
+-                        when (snap.state) { EngineState.RUNNING -> "STOP"; EngineState.STARTING -> "..."; EngineState.STOPPING -> "..."; else -> "START" },
+-                        fontSize = 24.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center
++                        when (snap.state) {
++                            EngineState.RUNNING, EngineState.RECOVERING -> "STOP"
++                            EngineState.STARTING, EngineState.STOPPING -> "..."
++                            else -> "START"
++                        },
++                        fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color.White, textAlign = TextAlign.Center
+                     )
+                 }
+             }
+-            Text("Engine: ${snap.state.name}", fontWeight = FontWeight.SemiBold,
+-                color = when (snap.state) { EngineState.RUNNING -> Good; EngineState.ERROR -> Danger; else -> TextDim })
++            Text(if (active) "Stop Monitoring" else "Start Monitoring", style = MaterialTheme.typography.labelLarge,
++                color = TextDim, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
++            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                StatusPill(status.label, statusColor(status))
++                StatusPill(if (headphones) "Headphones connected" else "No headphones", if (headphones) Good else Warn)
++            }
+             Text(snap.message, style = MaterialTheme.typography.bodyMedium)
+             snap.errorDetail?.let { Dim(it) }
++            recoveryHint(status)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = Warn) }
+             if (!granted) {
+                 Text("Microphone permission: NOT GRANTED", color = Warn)
+                 if (asked) OutlinedButton(onClick = openAppSettings) { Text("Open app settings") }
+             } else Text("Microphone permission: granted", color = Good, style = MaterialTheme.typography.bodySmall)
+-            if (running) {
+-                Dim("Input: ${snap.inputDevice}")
+-                Dim("Output: ${snap.outputDevice} (verified headphone-safe route)")
+-                Dim("Sample rate ${snap.sampleRate} Hz, block ${snap.blockFrames} frames, latency estimate ~${"%.0f".format(snap.latencyEstimateMs)} ms")
++            if (snap.inputSilent) Text("Input is digital silence. Another app may be using the microphone or Android is blocking it.", color = Warn, style = MaterialTheme.typography.bodySmall)
++        }
++
++        GlassCard {
++            SectionTitle("Session")
++            Dim("Voice preset: ${vm.presetName(presetId)}")
++            Dim("Input device: " + if (active) snap.inputDevice else "not monitoring")
++            Dim("Output device: " + if (active) snap.outputDevice + (if (snap.outputVerifiedSafe) " (route verified)" else "") else "not monitoring")
++            if (active) {
++                Dim("Sample rate ${snap.sampleRate} Hz, block ${snap.blockFrames} frames")
++                Dim(if (snap.measuredBufferLatencyMs >= 0f)
++                    "Latency: ~${"%.0f".format(snap.measuredBufferLatencyMs)} ms measured buffering (hardware delay not included). Buffer-based estimate ${"%.0f".format(snap.latencyEstimateMs)} ms."
++                else "Latency: measuring...")
+                 Dim("Underruns: ${snap.underruns}, late reads: ${snap.lateReads}")
+-                if (snap.inputSilent) Text("Input is digital silence. Another app may be using the microphone or Android is blocking it.", color = Warn, style = MaterialTheme.typography.bodySmall)
+                 snap.effectNotes.forEach { Dim(it) }
+             }
+-            Dim("Audio routing: processed audio goes to your headphones only. Not connected to any game or call.")
++            val on = StageReport.build(p).filter { it.enabled && it.name != "Input gain" && it.name != "Limiter" && it.name != "High-pass 80 Hz" }
++            Dim("Effects: " + if (on.isEmpty()) "none" else on.joinToString(" / ") { it.name.removePrefix("Voice: ") })
++            val pitch = VoiceProfile.totalPitch(p)
++            Dim("Pitch: " + if (pitch == 0f) "unchanged" else "%+.0f semitones".format(pitch))
++            Dim("Routing: local headphone monitoring only. NOVA cannot send this audio into Free Fire, WePlay or any other app.")
+         }
+ 
+         GlassCard {
+@@ -108,7 +147,12 @@ fun HomeScreen(vm: MicFxViewModel, onStartStop: () -> Unit, openAppSettings: ()
+                 Text(if (m.clipping) "CLIPPING" else "No clipping", color = if (m.clipping) Danger else Good, fontSize = 13.sp)
+                 Text(if (running) (if (m.voiceActive) "Voice detected" else "No voice") else "Voice: -", color = TextDim, fontSize = 13.sp)
+             }
+-            if (running) Dim("Noise floor %.0f dB, suppression now %.1f dB, total clips ${m.clipCount}".format(m.noiseFloorDb, m.reductionDb))
++            if (running) Dim("Noise floor %.0f dB, suppression %.1f dB, limiter %.1f dB, total clips ${m.clipCount}".format(m.noiseFloorDb, m.reductionDb, m.limiterReductionDb))
++        }
++
++        GlassCard {
++            SectionTitle("Voice preset")
++            ChipRow(Presets.builtIn.map { it.name to it }, { it.id == presetId }) { pr -> vm.applyPreset(pr) }
+         }
+ 
+         GlassCard {
+@@ -116,34 +160,17 @@ fun HomeScreen(vm: MicFxViewModel, onStartStop: () -> Unit, openAppSettings: ()
+             LabeledSlider("Mic gain (software)", "%+.0f dB".format(p.inputGainDb), p.inputGainDb,
+                 Limits.GAIN_MIN_DB..Limits.GAIN_MAX_DB, { v -> vm.update { it.copy(inputGainDb = v) } })
+             Dim("Software gain multiplies captured samples. It does not change the phone's hardware microphone sensitivity.")
+-            LabeledSlider("Monitor volume", "${(p.outputVolume * 100).toInt()}%", p.outputVolume,
++            LabeledSlider("Output volume", "${(p.outputVolume * 100).toInt()}%", p.outputVolume,
+                 0f..Limits.VOLUME_MAX, { v -> vm.update { it.copy(outputVolume = v) } })
+-            ToggleRow("Noise reduction", if (p.noiseReductionEnabled) "Adaptive suppressor running when engine is on" else "Off",
++            LabeledSlider("Pitch", "%+.0f st".format(p.pitchSemitones), p.pitchSemitones,
++                -Limits.PITCH_MAX_ST..Limits.PITCH_MAX_ST, { v -> vm.update { it.copy(pitchSemitones = Math.round(v).toFloat()) } })
++            ToggleRow("Noise reduction", if (p.noiseReductionEnabled) "Adaptive suppressor" else "Off",
+                 p.noiseReductionEnabled) { on -> vm.update { it.copy(noiseReductionEnabled = on) } }
+-            LabeledSlider("Bass", "%+.0f dB".format(p.bassDb), p.bassDb, -Limits.TONE_MAX_DB..Limits.TONE_MAX_DB,
+-                { v -> vm.update { it.copy(bassDb = v) } })
+-            LabeledSlider("Treble", "%+.0f dB".format(p.trebleDb), p.trebleDb, -Limits.TONE_MAX_DB..Limits.TONE_MAX_DB,
+-                { v -> vm.update { it.copy(trebleDb = v) } })
+-            Text("Voice effect", style = MaterialTheme.typography.bodyMedium)
+-            ChipRow(VoiceMode.values().map { it.label to it }, { it == p.voiceMode }) { mode -> vm.update { it.copy(voiceMode = mode) } }
+-            Dim(p.voiceMode.description)
+             ToggleRow("Echo effect", "Deliberate echo (not echo cancellation)", p.echoEnabled) { on -> vm.update { it.copy(echoEnabled = on) } }
+             ToggleRow("Reverb", "Room reverb", p.reverbEnabled) { on -> vm.update { it.copy(reverbEnabled = on) } }
+             ToggleRow("Bypass all effects", "Keeps gain, volume and limiter", p.bypass) { on -> vm.update { it.copy(bypass = on) } }
+             Button(onClick = { vm.resetControls() }) { Text("Reset controls") }
+         }
+-
+-        GlassCard {
+-            SectionTitle("Processing status")
+-            StageReport.build(p).forEach {
+-                val on = it.enabled
+-                val label = when { !on -> "off"; running -> "ACTIVE"; else -> "ready" }
+-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+-                    Text(it.name, fontSize = 13.sp)
+-                    Text(label, fontSize = 13.sp, color = if (on && running) Good else TextDim)
+-                }
+-            }
+-            Dim("Feedback warning: use headphones. Speaker monitoring is blocked by default because it causes loud howling.")
+-        }
++        Dim("Feedback warning: use headphones. Speaker monitoring is blocked by default because it causes loud howling.")
+     }
+ }
+diff --git a/app/src/main/java/com/nova/micfx/ui/screens/PresetsScreen.kt b/app/src/main/java/com/nova/micfx/ui/screens/PresetsScreen.kt
+index 2e3459d..a48cd6c 100644
+--- a/app/src/main/java/com/nova/micfx/ui/screens/PresetsScreen.kt
++++ b/app/src/main/java/com/nova/micfx/ui/screens/PresetsScreen.kt
+@@ -1,12 +1,23 @@
+ package com.nova.micfx.ui.screens
+ 
++import androidx.compose.foundation.BorderStroke
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.material3.Button
++import androidx.compose.material3.Card
++import androidx.compose.material3.CardDefaults
+ import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.saveable.rememberSaveable
++import androidx.compose.runtime.setValue
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.unit.dp
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+@@ -17,9 +28,11 @@ import com.nova.micfx.ui.MicFxViewModel
+ import com.nova.micfx.ui.components.Dim
+ import com.nova.micfx.ui.components.GlassCard
+ import com.nova.micfx.ui.components.SectionTitle
+-import com.nova.micfx.ui.theme.Good
+-import com.nova.micfx.ui.theme.TextDim
+-import androidx.compose.foundation.layout.fillMaxWidth
++import com.nova.micfx.ui.components.StatusPill
++import com.nova.micfx.ui.components.EffectTag
++import com.nova.micfx.ui.theme.ElectricBlue
++import com.nova.micfx.ui.theme.Navy
++import com.nova.micfx.ui.theme.NavyLight
+ 
+ @Composable
+ fun PresetsScreen(vm: MicFxViewModel) {
+@@ -28,33 +41,60 @@ fun PresetsScreen(vm: MicFxViewModel) {
+     val p by vm.params.collectAsStateWithLifecycle()
+     val snap by vm.snapshot.collectAsStateWithLifecycle()
+     val running = snap.state == EngineState.RUNNING
++    var query by rememberSaveable { mutableStateOf("") }
++    val results = Presets.search(query)
+ 
+     ScreenScaffold {
+-        SectionTitle("One-tap presets")
+-        Dim("Each preset sets real parameters on the audio engine. Stages below show what is on.")
+-        Presets.builtIn.forEach { preset ->
+-            GlassCard {
+-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+-                    Text(preset.name + if (active == preset.id) "  (active)" else "")
+-                    Button(onClick = { vm.applyPreset(preset) }) { Text("Apply") }
++        SectionTitle("Voice presets")
++        Dim("Each preset sets real parameters on the audio engine. Selecting one updates the processing instantly.")
++        OutlinedTextField(
++            value = query, onValueChange = { query = it }, singleLine = true,
++            label = { Text("Search presets") }, modifier = Modifier.fillMaxWidth()
++        )
++        if (results.isEmpty()) Dim("No preset matches \"$query\".")
++        results.forEach { preset ->
++            val selected = active == preset.id
++            Card(
++                modifier = Modifier.fillMaxWidth(),
++                shape = RoundedCornerShape(20.dp),
++                colors = CardDefaults.cardColors(containerColor = if (selected) NavyLight else Navy),
++                border = BorderStroke(if (selected) 2.dp else 1.dp, if (selected) ElectricBlue else NavyLight)
++            ) {
++                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
++                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++                        Text(preset.name)
++                        if (selected) StatusPill("SELECTED", ElectricBlue)
++                    }
++                    Dim(preset.description)
++                    Button(onClick = { vm.applyPreset(preset) }) { Text(if (selected) "Reapply" else "Select") }
+                 }
+-                Dim(preset.description)
+             }
+         }
++
+         GlassCard {
+-            Text("Custom" + if (active == "custom") "  (active)" else "")
++            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++                Text("Custom")
++                if (active == Presets.CUSTOM_ID) StatusPill("SELECTED", ElectricBlue)
++            }
+             Dim(if (custom == null) "Nothing saved yet. Set your controls, then press Save current." else "A custom setup is saved on this device.")
+             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                 Button(onClick = { vm.saveCustom() }) { Text("Save current") }
+                 OutlinedButton(onClick = { vm.applyCustom() }, enabled = custom != null) { Text("Restore") }
+             }
+         }
++
++        GlassCard {
++            Text("Reset to defaults")
++            Dim("Restores the Natural Voice settings.")
++            OutlinedButton(onClick = { vm.resetControls() }) { Text("Reset to defaults") }
++        }
++
+         GlassCard {
+             SectionTitle("Current stages")
+             StageReport.build(p).forEach {
+                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                     Text(it.name)
+-                    Text(if (!it.enabled) "off" else if (running) "ACTIVE" else "ready", color = if (it.enabled && running) Good else TextDim)
++                    EffectTag(it.enabled, running)
+                 }
+             }
+         }
+diff --git a/app/src/main/java/com/nova/micfx/ui/screens/SettingsScreen.kt b/app/src/main/java/com/nova/micfx/ui/screens/SettingsScreen.kt
+index 5ed6b48..7bbd4c0 100644
+--- a/app/src/main/java/com/nova/micfx/ui/screens/SettingsScreen.kt
++++ b/app/src/main/java/com/nova/micfx/ui/screens/SettingsScreen.kt
+@@ -3,12 +3,14 @@ package com.nova.micfx.ui.screens
+ import androidx.compose.foundation.clickable
+ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.material3.Button
+ import androidx.compose.material3.RadioButton
+ import androidx.compose.material3.Text
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.getValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
+ import androidx.lifecycle.compose.collectAsStateWithLifecycle
+ import com.nova.micfx.audio.BufferSizing
+ import com.nova.micfx.audio.DeviceItem
+@@ -71,6 +73,9 @@ fun SettingsScreen(vm: MicFxViewModel) {
+             ToggleRow("Keep running in background", "Uses a foreground service and a persistent notification. Off = microphone stops when the app leaves the screen.", s.runInBackground) { on ->
+                 vm.updateSettings { it.copy(runInBackground = on) }
+             }
++            ToggleRow("Auto-recover audio", "Restart the audio streams (up to 2 tries) after a stream error. Never recovers from a blocked route.", s.autoRecover) { on ->
++                vm.updateSettings { it.copy(autoRecover = on) }
++            }
+             ToggleRow("Voice-communication audio source", "May enable platform processing and different routing.", s.useCommunicationSource) { on ->
+                 vm.updateSettings { it.copy(useCommunicationSource = on) }
+             }
+@@ -95,6 +100,15 @@ fun SettingsScreen(vm: MicFxViewModel) {
+             Dim("Audio is processed on your device only. Nothing is recorded to storage and nothing is uploaded. The app has no internet permission. Settings and presets are stored locally.")
+         }
+ 
++        GlassCard {
++            SectionTitle("Application")
++            val ctx = LocalContext.current
++            val version = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "?" } catch (_: Exception) { "?" }
++            Dim("NOVA MIC FX $version (com.nova.micfx)")
++            Dim("Voice effects with local headphone monitoring. Cannot route into other apps.")
++            Button(onClick = { vm.resetSettings() }) { Text("Reset settings") }
++        }
++
+         GlassCard {
+             SectionTitle("Troubleshooting")
+             Dim("No sound: connect headphones, raise Monitor volume. Silent input: close other apps using the mic. " +
+diff --git a/app/src/main/java/com/nova/micfx/ui/theme/Theme.kt b/app/src/main/java/com/nova/micfx/ui/theme/Theme.kt
+index eccdad7..354a9fc 100644
+--- a/app/src/main/java/com/nova/micfx/ui/theme/Theme.kt
++++ b/app/src/main/java/com/nova/micfx/ui/theme/Theme.kt
+@@ -5,11 +5,12 @@ import androidx.compose.material3.darkColorScheme
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.graphics.Color
+ 
+-val Midnight = Color(0xFF05070D)
+-val Navy = Color(0xFF0B1224)
+-val NavyLight = Color(0xFF16224A)
+-val ElectricBlue = Color(0xFF2E8BFF)
++val Midnight = Color(0xFF04060B)
++val Navy = Color(0xFF0F131C)
++val NavyLight = Color(0xFF1B2232)
++val ElectricBlue = Color(0xFF19D3F3)   // electric cyan accent
+ val Violet = Color(0xFF8B5CF6)
++val DeepBlue = Color(0xFF2E8BFF)
+ val Cyan = Color(0xFF22D3EE)
+ val Warn = Color(0xFFFFB020)
+ val Danger = Color(0xFFFF5A6E)
+diff --git a/app/src/main/java/res/values-v28/themes.xml b/app/src/main/java/res/values-v28/themes.xml
+new file mode 100644
+index 0000000..8ad81a5
+--- /dev/null
++++ b/app/src/main/java/res/values-v28/themes.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <style name="Theme.NovaMicFx" parent="android:Theme.Material.NoActionBar">
++        <item name="android:windowBackground">@color/nova_bg</item>
++        <item name="android:statusBarColor">@android:color/transparent</item>
++        <item name="android:navigationBarColor">@android:color/transparent</item>
++        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
++    </style>
++</resources>
+diff --git a/app/src/test/java/com/nova/micfx/audio/EngineLogicTest.kt b/app/src/test/java/com/nova/micfx/audio/EngineLogicTest.kt
+index 6907f64..b267c63 100644
+--- a/app/src/test/java/com/nova/micfx/audio/EngineLogicTest.kt
++++ b/app/src/test/java/com/nova/micfx/audio/EngineLogicTest.kt
+@@ -80,4 +80,32 @@ class EngineLogicTest {
+         assertEquals(10f, BufferSizing.durationMs(480, 48000), 1e-4f)
+         assertEquals(0f, BufferSizing.durationMs(480, 0), 0f)
+     }
++
++    @Test fun repeatedStartStopCyclesStayConsistent() {
++        val m = EngineStateMachine()
++        repeat(100) {
++            assertTrue(m.transition(EngineState.STARTING))
++            assertFalse("second start while starting must be rejected", m.transition(EngineState.STARTING))
++            assertTrue(m.transition(EngineState.RUNNING))
++            assertFalse(m.transition(EngineState.STARTING))
++            assertTrue(m.transition(EngineState.STOPPING))
++            assertFalse(m.transition(EngineState.STOPPING))
++            assertTrue(m.transition(EngineState.IDLE))
++        }
++        assertEquals(EngineState.IDLE, m.state)
++    }
++
++    @Test fun recoveryPathsAreLegal() {
++        val m = EngineStateMachine()
++        m.transition(EngineState.STARTING); m.transition(EngineState.RUNNING)
++        assertTrue(m.transition(EngineState.RECOVERING))
++        assertTrue(m.transition(EngineState.RUNNING))
++        assertTrue(m.transition(EngineState.RECOVERING))
++        assertTrue(m.transition(EngineState.ERROR))
++        assertTrue(m.transition(EngineState.IDLE))
++        assertFalse(m.transition(EngineState.RECOVERING))
++        m.transition(EngineState.STARTING)
++        assertTrue(m.transition(EngineState.RECOVERING))
++        assertTrue(m.transition(EngineState.STOPPING))
++    }
+ }
+diff --git a/app/src/test/java/com/nova/micfx/audio/PipelineTest.kt b/app/src/test/java/com/nova/micfx/audio/PipelineTest.kt
+index 46f6693..14a1361 100644
+--- a/app/src/test/java/com/nova/micfx/audio/PipelineTest.kt
++++ b/app/src/test/java/com/nova/micfx/audio/PipelineTest.kt
+@@ -90,12 +90,13 @@ class PipelineTest {
+     }
+ 
+     @Test fun voiceProfilesAreDistinct() {
+-        assertEquals(0f, VoiceProfile.of(VoiceMode.NATURAL, 5f).pitchSemitones, 0f)
+-        assertTrue(VoiceProfile.of(VoiceMode.DEEP, 0f).pitchSemitones < 0f)
+-        assertTrue(VoiceProfile.of(VoiceMode.BRIGHT, 0f).pitchSemitones > 0f)
+-        assertEquals(3f, VoiceProfile.of(VoiceMode.CUSTOM, 3f).pitchSemitones, 0f)
+-        assertTrue(VoiceProfile.of(VoiceMode.ROBOT, 0f).ringMix > 0f)
+-        assertTrue(VoiceProfile.of(VoiceMode.RADIO, 0f).bandHighHz > VoiceProfile.of(VoiceMode.RADIO, 0f).bandLowHz)
+-        assertEquals(0f, VoiceProfile.of(VoiceMode.WARM, 0f).pitchSemitones, 0f)
++        assertEquals(0f, VoiceProfile.of(VoiceMode.NATURAL).pitchSemitones, 0f)
++        assertTrue(VoiceProfile.of(VoiceMode.DEEP).pitchSemitones < 0f)
++        assertTrue(VoiceProfile.of(VoiceMode.BRIGHT).pitchSemitones > 0f)
++        assertEquals(0f, VoiceProfile.of(VoiceMode.CUSTOM).pitchSemitones, 0f)
++        assertTrue(VoiceProfile.of(VoiceMode.ROBOT).ringMix > 0f)
++        assertTrue(VoiceProfile.of(VoiceMode.ALIEN).ringHz > VoiceProfile.of(VoiceMode.ROBOT).ringHz)
++        assertTrue(VoiceProfile.of(VoiceMode.RADIO).bandHighHz > VoiceProfile.of(VoiceMode.RADIO).bandLowHz)
++        assertEquals(0f, VoiceProfile.of(VoiceMode.WARM).pitchSemitones, 0f)
+     }
+ }
+diff --git a/app/src/test/java/com/nova/micfx/audio/PresetsTest.kt b/app/src/test/java/com/nova/micfx/audio/PresetsTest.kt
+index b0de7b9..4bfccc9 100644
+--- a/app/src/test/java/com/nova/micfx/audio/PresetsTest.kt
++++ b/app/src/test/java/com/nova/micfx/audio/PresetsTest.kt
+@@ -8,7 +8,7 @@ import org.junit.Test
+ class PresetsTest {
+     @Test fun everyBuiltInPresetIsWithinValidRanges() {
+         for (p in Presets.builtIn) assertEquals(p.name, p.params, p.params.validated())
+-        assertEquals(6, Presets.builtIn.size)
++        assertEquals(15, Presets.builtIn.size)
+         assertEquals(Presets.builtIn.size, Presets.builtIn.map { it.id }.toSet().size)
+     }
+ 
+@@ -36,9 +36,9 @@ class PresetsTest {
+ 
+     @Test fun codecRoundTripKeepsEverything() {
+         val p = EffectParams(
+-            bypass = true, inputGainDb = 7.5f, outputVolume = 1.2f, highPassEnabled = false,
++            bypass = true, inputGainDb = 7.5f, outputVolume = 1.2f, dryWet = 0.6f, limiterCeilingDb = -3f, highPassEnabled = false,
+             noiseReductionEnabled = true, noiseReductionStrength = 0.77f, gateEnabled = true, gateThresholdDb = -42f,
+-            bassDb = 3.5f, midDb = -2f, trebleDb = 4f, voiceMode = VoiceMode.ROBOT, customPitchSemitones = 3f,
++            bassDb = 3.5f, midDb = -2f, trebleDb = 4f, voiceMode = VoiceMode.ROBOT, pitchSemitones = 3f,
+             echoEnabled = true, echoDelayMs = 420f, echoFeedback = 0.55f, echoMix = 0.4f,
+             reverbEnabled = true, reverbRoom = 0.9f, reverbMix = 0.35f
+         )
+@@ -57,7 +57,7 @@ class PresetsTest {
+     @Test fun validationClampsEveryRange() {
+         val v = EffectParams(
+             outputVolume = 9f, noiseReductionStrength = 3f, gateThresholdDb = 10f, bassDb = -99f, midDb = 99f,
+-            trebleDb = 99f, customPitchSemitones = 99f, echoDelayMs = 1f, echoFeedback = 2f, echoMix = -1f,
++            trebleDb = 99f, pitchSemitones = 99f, echoDelayMs = 1f, echoFeedback = 2f, echoMix = -1f,
+             reverbRoom = 5f, reverbMix = 5f
+         ).validated()
+         assertEquals(Limits.VOLUME_MAX, v.outputVolume, 0f)
+@@ -65,7 +65,7 @@ class PresetsTest {
+         assertEquals(Limits.GATE_MAX_DB, v.gateThresholdDb, 0f)
+         assertEquals(-Limits.TONE_MAX_DB, v.bassDb, 0f)
+         assertEquals(Limits.TONE_MAX_DB, v.midDb, 0f)
+-        assertEquals(Limits.PITCH_MAX_ST, v.customPitchSemitones, 0f)
++        assertEquals(Limits.PITCH_MAX_ST, v.pitchSemitones, 0f)
+         assertEquals(Limits.ECHO_DELAY_MIN_MS, v.echoDelayMs, 0f)
+         assertEquals(Limits.ECHO_FEEDBACK_MAX, v.echoFeedback, 0f)
+         assertEquals(0f, v.echoMix, 0f)
+diff --git a/app/src/test/java/com/nova/micfx/audio/RobustnessTest.kt b/app/src/test/java/com/nova/micfx/audio/RobustnessTest.kt
+new file mode 100644
+index 0000000..7a27ca1
+--- /dev/null
++++ b/app/src/test/java/com/nova/micfx/audio/RobustnessTest.kt
+@@ -0,0 +1,180 @@
++package com.nova.micfx.audio
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class RobustnessTest {
++    private val sr = 48000
++    private fun run(p: AudioProcessingPipeline, src: FloatArray) = TestSignals.processInBlocks(src) { b, n -> p.process(b, n) }
++    private fun everythingOn() = EffectParams(
++        noiseReductionEnabled = true, gateEnabled = true, bassDb = 6f, trebleDb = 6f, voiceMode = VoiceMode.ALIEN,
++        echoEnabled = true, reverbEnabled = true, dryWet = 0.7f, inputGainDb = 12f
++    )
++
++    @Test fun silenceStaysSilentAndFinite() {
++        val p = AudioProcessingPipeline(sr).also { it.setParams(everythingOn()) }
++        val out = run(p, FloatArray(sr))
++        for (v in out) { assertTrue(!v.isNaN() && !v.isInfinite()); assertEquals(0f, v, 1e-6f) }
++    }
++
++    @Test fun veryQuietInputStaysFiniteAndQuiet() {
++        val p = AudioProcessingPipeline(sr).also { it.setParams(EffectParams(inputGainDb = 0f, outputVolume = 1f)) }
++        val out = run(p, TestSignals.noise(1e-5f, sr))
++        for (v in out) assertTrue(!v.isNaN() && Math.abs(v) < 1e-3f)
++    }
++
++    @Test fun fullScaleInputNeverExceedsLimiterCeiling() {
++        val p = AudioProcessingPipeline(sr).also { it.setParams(everythingOn().copy(outputVolume = 1.5f)) }
++        val out = run(p, TestSignals.sine(500.0, 1f, sr * 2, sr))
++        for (v in out) assertTrue(!v.isNaN() && Math.abs(v) <= p.ceiling + 1e-6f)
++        assertTrue("output must still carry signal", TestSignals.peak(out) > 0.1f)
++        assertTrue("clipping must have been counted", p.totalClipped > 0)
++    }
++
++    @Test fun limiterCeilingParameterIsHonoured() {
++        val p = AudioProcessingPipeline(sr).also { it.setParams(EffectParams(limiterCeilingDb = -6f, inputGainDb = 12f, outputVolume = 1f)) }
++        val out = run(p, TestSignals.sine(500.0, 0.8f, sr, sr))
++        assertTrue(TestSignals.peak(out) <= DspMath.dbToLinear(-6f) + 1e-4f)
++    }
++
++    @Test fun parameterChangesWhileProcessingStayStable() {
++        val p = AudioProcessingPipeline(sr)
++        val tmp = FloatArray(480)
++        val src = TestSignals.noise(0.4f, 480 * 60, 77L)
++        val all = Presets.builtIn
++        for (blk in 0 until 60) {
++            p.setParams(Presets.apply(all[blk % all.size]))
++            System.arraycopy(src, blk * 480, tmp, 0, 480)
++            p.process(tmp, 480)
++            for (v in tmp) assertTrue("block $blk", !v.isNaN() && !v.isInfinite() && Math.abs(v) <= p.ceiling + 1e-6f)
++        }
++    }
++
++    @Test fun invalidParametersAreSanitisedBeforeUse() {
++        val bad = EffectParams(
++            inputGainDb = Float.NaN, outputVolume = Float.POSITIVE_INFINITY, dryWet = Float.NaN,
++            limiterCeilingDb = 50f, echoDelayMs = Float.NaN, reverbRoom = Float.NaN, pitchSemitones = Float.NaN
++        )
++        val p = AudioProcessingPipeline(sr).also { it.setParams(bad) }
++        val out = run(p, TestSignals.sine(440.0, 0.3f, sr / 2, sr))
++        for (v in out) assertTrue(!v.isNaN() && !v.isInfinite())
++        assertEquals(Limits.LIMITER_MAX_DB, p.getParams().limiterCeilingDb, 0f)
++    }
++
++    @Test fun pcmConversionRoundTripsAndClamps() {
++        for (x in floatArrayOf(-1f, -0.5f, -0.001f, 0f, 0.001f, 0.5f, 0.999f)) {
++            assertEquals(x, DspMath.shortToFloat(DspMath.floatToShort(x)), 1.5e-4f)
++        }
++        assertEquals(32767, DspMath.floatToShort(1f).toInt())
++        assertEquals(32767, DspMath.floatToShort(10f).toInt())
++        assertEquals(-32768, DspMath.floatToShort(-10f).toInt())
++        assertEquals(0, DspMath.floatToShort(Float.NaN).toInt())
++        assertEquals(-1f, DspMath.shortToFloat(Short.MIN_VALUE), 0f)
++    }
++
++    @Test fun pitchAddsToVoiceCharacterAndIsClamped() {
++        assertEquals(-6f, VoiceProfile.totalPitch(EffectParams(voiceMode = VoiceMode.DEEP, pitchSemitones = -2f)), 0f)
++        assertEquals(-12f, VoiceProfile.totalPitch(EffectParams(voiceMode = VoiceMode.DEEP, pitchSemitones = -12f)), 0f)
++        assertEquals(0f, VoiceProfile.totalPitch(EffectParams(voiceMode = VoiceMode.DEEP, pitchSemitones = -2f, bypass = true)), 0f)
++        assertEquals(3f, VoiceProfile.totalPitch(EffectParams(voiceMode = VoiceMode.CUSTOM, pitchSemitones = 3f)), 0f)
++    }
++
++    @Test fun pitchSliderReallyShiftsFrequency() {
++        val p = AudioProcessingPipeline(sr).also { it.setParams(EffectParams(pitchSemitones = -6f, outputVolume = 1f)) }
++        val out = run(p, TestSignals.sine(440.0, 0.3f, sr * 2, sr))
++        assertEquals(440.0 * Math.pow(2.0, -0.5), TestSignals.estimateFrequency(out, sr, sr * 2, sr), 311.0 * 0.08)
++    }
++
++    @Test fun dryWetZeroReturnsTheUnprocessedVoice() {
++        val src = TestSignals.sine(440.0, 0.3f, sr, sr)
++        val wetOnly = AudioProcessingPipeline(sr).also { it.setParams(EffectParams(outputVolume = 1f)) }
++        val dryMix = AudioProcessingPipeline(sr).also {
++            it.setParams(EffectParams(outputVolume = 1f, dryWet = 0f, voiceMode = VoiceMode.ROBOT, echoEnabled = true, reverbEnabled = true, pitchSemitones = -5f))
++        }
++        val a = run(wetOnly, src); val b = run(dryMix, src)
++        for (i in sr / 2 until sr) assertEquals(a[i], b[i], 2e-3f)
++    }
++
++    @Test fun resetEffectsKeepsLevelsButClearsEffects() {
++        val p = EffectParams(inputGainDb = 6f, outputVolume = 1.1f, limiterCeilingDb = -3f, highPassEnabled = false,
++            echoEnabled = true, reverbEnabled = true, voiceMode = VoiceMode.DEEP, pitchSemitones = 3f, noiseReductionEnabled = true, dryWet = 0.2f)
++        val r = p.resetEffects()
++        assertEquals(6f, r.inputGainDb, 0f); assertEquals(1.1f, r.outputVolume, 0f); assertEquals(-3f, r.limiterCeilingDb, 0f)
++        assertFalse(r.highPassEnabled)
++        assertFalse(r.echoEnabled); assertFalse(r.reverbEnabled); assertFalse(r.noiseReductionEnabled)
++        assertEquals(VoiceMode.NATURAL, r.voiceMode); assertEquals(0f, r.pitchSemitones, 0f); assertEquals(1f, r.dryWet, 0f)
++    }
++
++    @Test fun presetLibrarySearchAndIds() {
++        assertEquals(Presets.builtIn.size, Presets.search("").size)
++        assertTrue(Presets.search("pitch").map { it.id }.containsAll(listOf("low_pitch", "high_pitch")))
++        assertEquals(listOf("robot"), Presets.search("ROBOT").map { it.id })
++        assertTrue(Presets.search("zzzzqq").isEmpty())
++        assertEquals(Presets.builtIn.size, Presets.builtIn.map { it.id }.toSet().size)
++        assertEquals("alien", Presets.byId("alien")?.id)
++        assertNull(Presets.byId("does_not_exist"))
++        assertEquals("robot", Presets.matching(Presets.apply(Presets.ROBOT))?.id)
++        assertNull(Presets.matching(Presets.apply(Presets.ROBOT).copy(bassDb = 1f)))
++    }
++
++    @Test fun everyPresetReallyChangesProcessing() {
++        val base = Presets.apply(Presets.NATURAL)
++        for (pr in Presets.builtIn) if (pr.id != "natural") assertTrue(pr.id, Presets.apply(pr) != base)
++        val src = TestSignals.sine(440.0, 0.3f, sr, sr)
++        val clean = run(AudioProcessingPipeline(sr).also { it.setParams(base) }, src)
++        for (id in listOf("deep", "low_pitch", "high_pitch", "robot", "alien", "radio", "echo", "reverb")) {
++            val out = run(AudioProcessingPipeline(sr).also { it.setParams(Presets.apply(Presets.byId(id)!!)) }, src)
++            var diff = 0f
++            for (i in out.indices) diff = maxOf(diff, Math.abs(out[i] - clean[i]))
++            assertTrue("preset $id must alter the audio", diff > 0.02f)
++        }
++    }
++
++    @Test fun settingsCodecRoundTripsAndValidates() {
++        val s = EngineSettings(48000, 3, 12, 7, true, true, false, true, true, true, true)
++        assertEquals(s, SettingsCodec.decode(SettingsCodec.encode(s)))
++        assertEquals(EngineSettings(), SettingsCodec.decode(null))
++        assertEquals(EngineSettings(), SettingsCodec.decode("junk;;=;a"))
++        val bad = SettingsCodec.decode("sampleRate=22050;bufferMult=99;inId=-5;outId=-9")
++        assertEquals(0, bad.preferredSampleRate); assertEquals(4, bad.bufferMultiplier)
++        assertEquals(-1, bad.preferredInputId); assertEquals(-1, bad.preferredOutputId)
++    }
++
++    @Test fun missingPreferredDevicesFallBackToDefault() {
++        assertEquals(7, DevicePreference.resolve(7, listOf(3, 7)))
++        assertNull(DevicePreference.resolve(9, listOf(3, 7)))
++        assertNull(DevicePreference.resolve(-1, listOf(3, 7)))
++        assertTrue(DevicePreference.isMissing(9, listOf(3, 7)))
++        assertFalse(DevicePreference.isMissing(-1, listOf(3, 7)))
++        assertFalse(DevicePreference.isMissing(3, listOf(3, 7)))
++    }
++
++    @Test fun statusIsDerivedFromRealEngineState() {
++        fun st(s: EngineState, f: FailureKind = FailureKind.NONE) = EngineSnapshot(state = s, failure = f)
++        assertEquals(DisplayStatus.READY, StatusResolver.resolve(st(EngineState.IDLE), true, false))
++        assertEquals(DisplayStatus.PERMISSION_NEEDED, StatusResolver.resolve(st(EngineState.IDLE), false, false))
++        assertEquals(DisplayStatus.REQUESTING_PERMISSION, StatusResolver.resolve(st(EngineState.IDLE), false, true))
++        assertEquals(DisplayStatus.STARTING, StatusResolver.resolve(st(EngineState.STARTING), true, false))
++        assertEquals(DisplayStatus.MONITORING, StatusResolver.resolve(st(EngineState.RUNNING), true, false))
++        assertEquals(DisplayStatus.RECOVERING, StatusResolver.resolve(st(EngineState.RECOVERING), true, false))
++        assertEquals(DisplayStatus.UNSUPPORTED_ROUTE, StatusResolver.resolve(st(EngineState.ERROR, FailureKind.UNSUPPORTED_ROUTE), true, false))
++        assertEquals(DisplayStatus.MIC_BUSY, StatusResolver.resolve(st(EngineState.ERROR, FailureKind.MIC_BUSY), true, false))
++        assertEquals(DisplayStatus.PERMISSION_NEEDED, StatusResolver.resolve(st(EngineState.ERROR, FailureKind.PERMISSION), true, false))
++        assertEquals(DisplayStatus.DEVICE_DISCONNECTED, StatusResolver.resolve(st(EngineState.IDLE, FailureKind.DEVICE_DISCONNECTED), true, false))
++        assertEquals(DisplayStatus.ERROR, StatusResolver.resolve(st(EngineState.ERROR, FailureKind.OTHER), true, false))
++    }
++
++    @Test fun capabilitiesNeverClaimDirectInjection() {
++        for (mic in listOf(true, false)) for (perm in listOf(true, false)) for (hp in listOf(true, false)) for (usb in listOf(true, false)) {
++            val c = CapabilityModel.summarize(mic, perm, hp, usb)
++            assertEquals(CompatStatus.NO, c.directInjection.status)
++            assertTrue(c.externalHardware.status != CompatStatus.OK)   // never "verified"
++        }
++        assertEquals(CompatStatus.OK, CapabilityModel.summarize(true, true, true, false).localMonitoring.status)
++        assertEquals(CompatStatus.WARN, CapabilityModel.summarize(true, true, false, false).localMonitoring.status)
++        assertEquals(CompatStatus.NO, CapabilityModel.summarize(false, true, true, false).processingInsideNova.status)
++    }
++}

@@ -4,30 +4,38 @@ Real-time microphone effects for Android (Kotlin, Jetpack Compose, Material 3, M
 Package: `com.nova.micfx` - minSdk 26, targetSdk/compileSdk 34.
 
 ## What it does (Mode A: live microphone FX)
-The app captures the microphone with `AudioRecord`, processes it on a dedicated audio thread, and plays the
-result through `AudioTrack` to **headphones**. Every control changes real DSP:
+NOVA captures the microphone with `AudioRecord`, processes it on a dedicated audio thread and plays it through
+`AudioTrack` to **headphones**. Every control changes real DSP:
 
 | Feature | Implementation |
 |---|---|
-| Mic gain (-12..+24 dB) | Software gain on captured samples with per-sample smoothing. It does **not** change the phone's hardware microphone sensitivity. |
-| Monitor volume | Smoothed output gain (0..150%) |
-| Limiter / clipping | Peak limiter (instant attack, 80 ms release, hard ceiling 0.97). Input and output clipping are counted and shown. |
-| High-pass 80 Hz | RBJ biquad |
-| Noise reduction | Adaptive noise-floor suppressor (minimum-statistics floor, voice-activity detector, up to -24 dB) + separate noise gate. **Not AI noise cancellation**; it cannot remove noise while you speak. |
-| Bass / voice presence / treble | Low shelf 120 Hz, peaking 2.5 kHz, high shelf 6 kHz (biquads, stability checked, gains glide) |
-| Voice changer | Deep / Bright / Custom use a real duration-preserving pitch shifter (two crossfaded delay-line heads). Warm / Radio / Telephone are filter-only. Robot is ring modulation. |
-| Echo effect | Delay line with damped feedback (feedback capped at 0.8, cannot run away). This is a deliberate effect, **not** echo cancellation. |
-| Reverb | Comb + all-pass reverb with room size and wet/dry mix |
-| System effects | Optional Android `NoiseSuppressor`, `AcousticEchoCanceler`, `AutomaticGainControl`. Availability is queried and the real enabled state is displayed. |
-| Presets | Gaming, Clear Voice, Deep Voice, Noise Reduction, Radio, Natural, plus a locally saved Custom preset |
-| Compatibility screen | Queries real device features, routes and effects; manual checklist |
+| Mic gain (-12..+24 dB) | Software gain on captured samples with per-sample smoothing. Does **not** change the phone's hardware mic sensitivity. |
+| Output gain / limiter | Smoothed output volume (0..150%) and a peak limiter with adjustable ceiling (-12..-0.3 dB). Clipping is counted and shown. |
+| Pitch (-12..+12 st) | Real duration-preserving pitch shifter (two crossfaded delay-line heads). Not a sample-rate trick. Adds ~20 ms. |
+| Voice presets | Natural, Clean, Deep, Low Pitch, High Pitch, Robot, Alien, Radio, Echo, Reverb, Gaming, Noise Reduction, Bright, Warm, Telephone, Custom (saved locally). Stable ids, search, selected indicator. |
+| Noise reduction | Adaptive noise-floor suppressor (minimum statistics, voice-activity detection, up to -24 dB) + noise gate. **Not AI noise cancellation.** |
+| Equalizer | Bass (120 Hz shelf), voice presence (2.5 kHz), treble (6 kHz shelf) biquads with gliding gains |
+| Echo / Reverb | Delay line with damped feedback (capped 0.8) / comb + all-pass reverb |
+| Dry/wet | Blend between unprocessed and processed voice |
+| System effects | Optional Android NoiseSuppressor / AEC / AGC; availability and the REAL enabled state are shown |
+| Recovery | Up to 2 automatic stream restarts after a dead audio stream (never after a blocked/unsafe route) |
+| Latency | Measured output-buffer queue + capture block (hardware delay not measurable) next to a buffer-size estimate |
 
-## IMPORTANT: Android routing limitation (Mode B is not supported)
-A normal Android app **cannot** replace the microphone input of a game, Discord, a voice-chat app or a phone call.
-Android gives every app its own capture stream from the system audio server; there is no public, supported API for
-one app to inject processed audio into another app's microphone. NOVA MIC FX does not use root, hidden APIs,
-accessibility tricks or "compatibility toggles", so the UI always reports external-app routing as **not supported**.
-Processed audio stays inside NOVA MIC FX and is only heard on your headphones. Do not expect it to work in games.
+## IMPORTANT: Free Fire, WePlay and other voice-chat apps
+**NOVA MIC FX cannot put its voice into another app's microphone.** What was investigated for stock, non-rooted Android:
+
+- Every app gets its own capture stream from the audio server; `AudioRecord.setPreferredDevice()` and
+  `AudioManager` communication-device APIs only affect the calling app's own streams. They do not inject audio.
+- `AudioTrack` output is playback, never another app's microphone input.
+- `AudioPlaybackCapture` records *other apps' playback* (with permission); it cannot replace a microphone.
+- Accessibility services, overlays and notification access cannot route audio.
+- Root / privileged audio policy changes are outside an ordinary APK and are not used.
+- **Device-dependent, unverified:** a USB audio interface or a hardware voice changer connected over USB-C may be used as the
+  microphone by some apps on some phones. NOVA only detects a USB input and labels it "unverified".
+
+So the app shows "Direct injection: unavailable" and never "Compatible with Free Fire/WePlay". Practical options:
+use the game's own voice effects/noise suppression, a hardware voice changer / USB audio interface, or (on PC) a virtual audio cable.
+NOVA stays useful as a live headphone voice-effects monitor and to find settings you like.
 
 ## Safety / feedback
 - Monitoring is blocked through the phone speaker (feedback howl) unless you allow it in Settings.
@@ -80,6 +88,16 @@ APK: `app/build/outputs/apk/debug/app-debug.apk`
 `gradle-wrapper.jar` could not be produced in the offline environment this ZIP was generated in. The GitHub Actions
 workflow detects this and generates the official Gradle 8.7 wrapper automatically. For local builds run once:
 `gradle wrapper --gradle-version 8.7` (or just open the project in Android Studio).
+
+## Updating an existing repository with this ZIP
+```
+cd YOUR_REPO_FOLDER
+git pull origin main
+unzip -o ../NOVA-MIC-FX.zip -d ..      # overwrites files with the same names
+git status
+git add -A && git commit -m "Upgrade NOVA MIC FX" && git push origin main
+```
+Check `git status` first: if you edited files yourself, review the diff before committing.
 
 ## Push to GitHub from Termux
 ```

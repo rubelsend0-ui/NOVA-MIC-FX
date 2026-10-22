@@ -51,7 +51,7 @@ class PitchShifter(sampleRate: Int, windowMs: Float = 40f) {
 }
 
 /** Ring modulator used for the Robot voice. */
-class RingModulator(private val sampleRate: Int, private val carrierHz: Float = 50f) {
+class RingModulator(private val sampleRate: Int, var carrierHz: Float = 50f) {
     private var phase = 0.0
     fun process(buf: FloatArray, n: Int, mix: Float) {
         if (mix <= 0f) return

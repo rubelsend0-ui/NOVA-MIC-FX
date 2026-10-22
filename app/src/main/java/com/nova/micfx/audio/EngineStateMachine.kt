@@ -1,6 +1,10 @@
 package com.nova.micfx.audio
 
-/** Thread-safe engine lifecycle: IDLE -> STARTING -> RUNNING -> STOPPING -> IDLE (ERROR from any active state). */
+/**
+ * Thread-safe engine lifecycle:
+ * IDLE -> STARTING -> RUNNING -> STOPPING -> IDLE, with RECOVERING for automatic stream recovery
+ * and ERROR reachable from every active state.
+ */
 class EngineStateMachine {
     private var current = EngineState.IDLE
     val state: EngineState @Synchronized get() = current
@@ -19,8 +23,9 @@ class EngineStateMachine {
     companion object {
         private val ALLOWED: Map<EngineState, Set<EngineState>> = mapOf(
             EngineState.IDLE to setOf(EngineState.STARTING, EngineState.ERROR),
-            EngineState.STARTING to setOf(EngineState.RUNNING, EngineState.STOPPING, EngineState.ERROR),
-            EngineState.RUNNING to setOf(EngineState.STOPPING, EngineState.ERROR),
+            EngineState.STARTING to setOf(EngineState.RUNNING, EngineState.RECOVERING, EngineState.STOPPING, EngineState.ERROR),
+            EngineState.RUNNING to setOf(EngineState.STOPPING, EngineState.RECOVERING, EngineState.ERROR),
+            EngineState.RECOVERING to setOf(EngineState.RUNNING, EngineState.STOPPING, EngineState.ERROR),
             EngineState.STOPPING to setOf(EngineState.IDLE),
             EngineState.ERROR to setOf(EngineState.STARTING, EngineState.IDLE)
         )

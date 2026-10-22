@@ -4,6 +4,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,6 +24,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -33,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nova.micfx.audio.DspMath
 import com.nova.micfx.ui.theme.Danger
+import com.nova.micfx.ui.theme.Good
 import com.nova.micfx.ui.theme.ElectricBlue
 import com.nova.micfx.ui.theme.Navy
 import com.nova.micfx.ui.theme.NavyLight
@@ -121,4 +124,36 @@ fun StatusChip(text: String, color: Color) {
         text, color = color, fontSize = 12.sp, fontWeight = FontWeight.Medium,
         modifier = Modifier.padding(end = 6.dp)
     )
+}
+
+
+/** Small rounded status label. */
+@Composable
+fun StatusPill(text: String, color: Color) {
+    Box(Modifier.clip(RoundedCornerShape(50)).background(color.copy(alpha = 0.18f)).padding(horizontal = 10.dp, vertical = 4.dp)) {
+        Text(text, color = color, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+/** Shows the REAL processing state of an effect: ACTIVE only when enabled and the engine is running. */
+@Composable
+fun EffectTag(enabled: Boolean, running: Boolean) {
+    when {
+        !enabled -> StatusPill("OFF", TextDim)
+        running -> StatusPill("ACTIVE", Good)
+        else -> StatusPill("READY", Warn)
+    }
+}
+
+/** Effect card: name, description, state tag, then the controls. */
+@Composable
+fun EffectCard(title: String, description: String, enabled: Boolean, running: Boolean, content: @Composable ColumnScope.() -> Unit) {
+    GlassCard {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            EffectTag(enabled, running)
+        }
+        Dim(description)
+        content()
+    }
 }

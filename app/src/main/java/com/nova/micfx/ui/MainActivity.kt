@@ -9,12 +9,21 @@ import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.runtime.LaunchedEffect
+import android.widget.Toast
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -50,8 +59,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         setContent {
             NovaTheme {
+                val msg by vm.message.collectAsStateWithLifecycle()
+                LaunchedEffect(msg) { msg?.let { Toast.makeText(this@MainActivity, it, Toast.LENGTH_SHORT).show(); vm.clearMessage() } }
                 var tab by rememberSaveable { mutableIntStateOf(0) }
                 var startAfterPermission by rememberSaveable { mutableIntStateOf(0) }
                 val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -63,6 +75,7 @@ class MainActivity : ComponentActivity() {
                     if (vm.engine.hasPermission()) vm.toggleEngine()
                     else {
                         startAfterPermission = 1
+                        vm.setPermissionPending(true)
                         val perms = if (Build.VERSION.SDK_INT >= 33)
                             arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
                         else arrayOf(Manifest.permission.RECORD_AUDIO)
@@ -91,6 +104,7 @@ class MainActivity : ComponentActivity() {
                 ) { pad: PaddingValues ->
                     Box(
                         Modifier.fillMaxSize().padding(pad)
+                            .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal))
                             .background(Brush.verticalGradient(listOf(Midnight, Color(0xFF070B1A), Midnight)))
                     ) {
                         when (tab) {
