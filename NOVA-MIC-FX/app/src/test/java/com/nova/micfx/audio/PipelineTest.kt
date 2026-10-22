@@ -90,12 +90,13 @@ class PipelineTest {
     }
 
     @Test fun voiceProfilesAreDistinct() {
-        assertEquals(0f, VoiceProfile.of(VoiceMode.NATURAL, 5f).pitchSemitones, 0f)
-        assertTrue(VoiceProfile.of(VoiceMode.DEEP, 0f).pitchSemitones < 0f)
-        assertTrue(VoiceProfile.of(VoiceMode.BRIGHT, 0f).pitchSemitones > 0f)
-        assertEquals(3f, VoiceProfile.of(VoiceMode.CUSTOM, 3f).pitchSemitones, 0f)
-        assertTrue(VoiceProfile.of(VoiceMode.ROBOT, 0f).ringMix > 0f)
-        assertTrue(VoiceProfile.of(VoiceMode.RADIO, 0f).bandHighHz > VoiceProfile.of(VoiceMode.RADIO, 0f).bandLowHz)
-        assertEquals(0f, VoiceProfile.of(VoiceMode.WARM, 0f).pitchSemitones, 0f)
+        assertEquals(0f, VoiceProfile.of(VoiceMode.NATURAL).pitchSemitones, 0f)
+        assertTrue(VoiceProfile.of(VoiceMode.DEEP).pitchSemitones < 0f)
+        assertTrue(VoiceProfile.of(VoiceMode.BRIGHT).pitchSemitones > 0f)
+        assertEquals(0f, VoiceProfile.of(VoiceMode.CUSTOM).pitchSemitones, 0f)
+        assertTrue(VoiceProfile.of(VoiceMode.ROBOT).ringMix > 0f)
+        assertTrue(VoiceProfile.of(VoiceMode.ALIEN).ringHz > VoiceProfile.of(VoiceMode.ROBOT).ringHz)
+        assertTrue(VoiceProfile.of(VoiceMode.RADIO).bandHighHz > VoiceProfile.of(VoiceMode.RADIO).bandLowHz)
+        assertEquals(0f, VoiceProfile.of(VoiceMode.WARM).pitchSemitones, 0f)
     }
 }

@@ -3,12 +3,14 @@ package com.nova.micfx.ui.screens
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.Button
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nova.micfx.audio.BufferSizing
 import com.nova.micfx.audio.DeviceItem
@@ -71,6 +73,9 @@ fun SettingsScreen(vm: MicFxViewModel) {
             ToggleRow("Keep running in background", "Uses a foreground service and a persistent notification. Off = microphone stops when the app leaves the screen.", s.runInBackground) { on ->
                 vm.updateSettings { it.copy(runInBackground = on) }
             }
+            ToggleRow("Auto-recover audio", "Restart the audio streams (up to 2 tries) after a stream error. Never recovers from a blocked route.", s.autoRecover) { on ->
+                vm.updateSettings { it.copy(autoRecover = on) }
+            }
             ToggleRow("Voice-communication audio source", "May enable platform processing and different routing.", s.useCommunicationSource) { on ->
                 vm.updateSettings { it.copy(useCommunicationSource = on) }
             }
@@ -93,6 +98,15 @@ fun SettingsScreen(vm: MicFxViewModel) {
         GlassCard {
             SectionTitle("Privacy")
             Dim("Audio is processed on your device only. Nothing is recorded to storage and nothing is uploaded. The app has no internet permission. Settings and presets are stored locally.")
+        }
+
+        GlassCard {
+            SectionTitle("Application")
+            val ctx = LocalContext.current
+            val version = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "?" } catch (_: Exception) { "?" }
+            Dim("NOVA MIC FX $version (com.nova.micfx)")
+            Dim("Voice effects with local headphone monitoring. Cannot route into other apps.")
+            Button(onClick = { vm.resetSettings() }) { Text("Reset settings") }
         }
 
         GlassCard {

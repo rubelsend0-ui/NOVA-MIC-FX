@@ -7,20 +7,25 @@ data class VoiceProfile(
     val midDb: Float = 0f,
     val trebleDb: Float = 0f,
     val ringMix: Float = 0f,
+    val ringHz: Float = 50f,
     val bandLowHz: Float = 0f,
     val bandHighHz: Float = 0f      // 0 = no band limiting
 ) {
     companion object {
-        fun of(mode: VoiceMode, customSemitones: Float): VoiceProfile = when (mode) {
-            VoiceMode.NATURAL -> VoiceProfile()
+        fun of(mode: VoiceMode): VoiceProfile = when (mode) {
+            VoiceMode.NATURAL, VoiceMode.CUSTOM -> VoiceProfile()
             VoiceMode.DEEP -> VoiceProfile(pitchSemitones = -4f, bassDb = 4f)
             VoiceMode.BRIGHT -> VoiceProfile(pitchSemitones = 2f, midDb = 2f, trebleDb = 4f)
             VoiceMode.WARM -> VoiceProfile(bassDb = 4f, trebleDb = -3f)
             VoiceMode.RADIO -> VoiceProfile(midDb = 3f, bandLowHz = 300f, bandHighHz = 3400f)
             VoiceMode.TELEPHONE -> VoiceProfile(midDb = 2f, bandLowHz = 400f, bandHighHz = 3000f)
-            VoiceMode.ROBOT -> VoiceProfile(ringMix = 0.8f)
-            VoiceMode.CUSTOM -> VoiceProfile(pitchSemitones = customSemitones)
+            VoiceMode.ROBOT -> VoiceProfile(ringMix = 0.8f, ringHz = 50f)
+            VoiceMode.ALIEN -> VoiceProfile(pitchSemitones = 3f, ringMix = 0.5f, ringHz = 200f, midDb = 2f)
         }
+
+        /** Total pitch shift in semitones that the pipeline will really apply. */
+        fun totalPitch(p: EffectParams): Float =
+            if (p.bypass) 0f else (of(p.voiceMode).pitchSemitones + p.pitchSemitones).coerceIn(-Limits.PITCH_MAX_ST, Limits.PITCH_MAX_ST)
     }
 }
 
@@ -28,22 +33,22 @@ data class VoiceProfile(
 object StageReport {
     fun build(p: EffectParams): List<StageStatus> {
         val fx = !p.bypass
-        val voice = VoiceProfile.of(p.voiceMode, p.customPitchSemitones)
-        val voiceName = when {
-            p.voiceMode == VoiceMode.NATURAL -> "Voice: Natural"
-            voice.pitchSemitones != 0f -> "Voice: ${p.voiceMode.label} (pitch ${"%+.0f".format(voice.pitchSemitones)} st)"
-            else -> "Voice: ${p.voiceMode.label}"
-        }
+        val voice = VoiceProfile.of(p.voiceMode)
+        val pitch = VoiceProfile.totalPitch(p)
+        val voiceName = if (p.voiceMode == VoiceMode.NATURAL || p.voiceMode == VoiceMode.CUSTOM) "Voice: ${p.voiceMode.label}" else "Voice: ${p.voiceMode.label}"
+        val voiceActive = fx && (p.voiceMode != VoiceMode.NATURAL && p.voiceMode != VoiceMode.CUSTOM)
         return listOf(
             StageStatus("Input gain", true, "%+.0f dB software gain".format(p.inputGainDb)),
             StageStatus("High-pass 80 Hz", p.highPassEnabled, if (p.highPassEnabled) "Removes rumble" else "Off"),
             StageStatus("Noise suppressor", fx && p.noiseReductionEnabled, if (p.bypass) "Bypassed" else "Adaptive noise-floor suppressor"),
             StageStatus("Noise gate", fx && p.gateEnabled, if (p.bypass) "Bypassed" else "Threshold %.0f dB".format(p.gateThresholdDb)),
-            StageStatus("Tone EQ", fx && (p.bassDb != 0f || p.midDb != 0f || p.trebleDb != 0f), "Bass/mid/treble biquads"),
-            StageStatus(voiceName, fx && p.voiceMode != VoiceMode.NATURAL, if (p.bypass) "Bypassed" else p.voiceMode.description),
+            StageStatus("Pitch shift", fx && pitch != 0f, if (pitch != 0f) "%+.0f semitones (duration preserved)".format(pitch) else "Off"),
+            StageStatus("Tone EQ", fx && (p.bassDb != 0f || p.midDb != 0f || p.trebleDb != 0f || voice.bassDb != 0f || voice.midDb != 0f || voice.trebleDb != 0f), "Bass/mid/treble biquads"),
+            StageStatus(voiceName, voiceActive, if (p.bypass) "Bypassed" else p.voiceMode.description),
             StageStatus("Echo effect", fx && p.echoEnabled, "Delay line with feedback"),
             StageStatus("Reverb", fx && p.reverbEnabled, "Comb + all-pass reverb"),
-            StageStatus("Limiter", true, "Always on, protects output")
+            StageStatus("Dry/wet mix", fx && p.dryWet < 0.999f, "%.0f%% processed".format(p.dryWet * 100f)),
+            StageStatus("Limiter", true, "Always on, ceiling %.1f dB".format(p.limiterCeilingDb))
         )
     }
 }
@@ -53,7 +58,7 @@ object StageReport {
  * volatile reference so the UI thread can change them at any time.
  *
  * Order: gain -> high-pass -> noise reduction -> pitch / ring mod -> tone EQ -> band limit
- *        -> echo -> reverb -> output volume -> limiter.
+ *        -> echo -> reverb -> dry/wet -> output volume -> limiter.
  */
 class AudioProcessingPipeline(val sampleRate: Int) {
     @Volatile private var params: EffectParams = EffectParams()
@@ -68,10 +73,13 @@ class AudioProcessingPipeline(val sampleRate: Int) {
     private val echo = EchoProcessor(sampleRate)
     private val reverb = ReverbProcessor(sampleRate)
     private val limiter = LimiterProcessor(sampleRate)
+    private val dry = FloatArray(MAX_BLOCK)
 
     private val smoothCoef = DspMath.smoothingCoefficient(15f, sampleRate)
     private var curGain = 1f
     private var curVolume = 0.8f
+    private var curMix = 1f
+    private var lastCeilingDb = Float.NaN
 
     // Measurements of the most recent block
     var inputPeak = 0f; private set
@@ -97,6 +105,11 @@ class AudioProcessingPipeline(val sampleRate: Int) {
         val fx = !p.bypass
         val target = DspMath.dbToLinear(p.inputGainDb)
 
+        if (p.limiterCeilingDb != lastCeilingDb) {
+            lastCeilingDb = p.limiterCeilingDb
+            limiter.ceiling = DspMath.dbToLinear(p.limiterCeilingDb)
+        }
+
         rawInputClipped = DspMath.countAtOrAbove(buf, n, 0.999f) > 0
 
         // 1. Input gain with per-sample smoothing (no zipper noise / sudden jumps)
@@ -116,14 +129,19 @@ class AudioProcessingPipeline(val sampleRate: Int) {
         }
         highPassWasOn = p.highPassEnabled
 
+        // Keep a dry copy for the dry/wet control (only when it is actually needed)
+        val mixOn = fx && (p.dryWet < 0.999f || curMix < 0.999f) && n <= dry.size
+        if (mixOn) System.arraycopy(buf, 0, dry, 0, n)
+
         // 3. Noise reduction (also tracks voice activity for the UI when disabled)
         noise.configure(fx && p.noiseReductionEnabled, p.noiseReductionStrength, fx && p.gateEnabled, p.gateThresholdDb)
         noise.process(buf, n)
 
-        // 4. Voice character
-        val voice = if (fx) VoiceProfile.of(p.voiceMode, p.customPitchSemitones) else VoiceProfile()
-        pitch.ratio = DspMath.semitonesToRatio(voice.pitchSemitones)
+        // 4. Voice character: real pitch shifting + ring modulation
+        val voice = if (fx) VoiceProfile.of(p.voiceMode) else VoiceProfile()
+        pitch.ratio = DspMath.semitonesToRatio(VoiceProfile.totalPitch(p))
         pitch.process(buf, n)
+        ring.carrierHz = voice.ringHz
         ring.process(buf, n, voice.ringMix)
 
         // 5. Tone controls (user offsets + voice profile offsets)
@@ -139,7 +157,20 @@ class AudioProcessingPipeline(val sampleRate: Int) {
         reverb.configure(fx && p.reverbEnabled, p.reverbRoom, p.reverbMix)
         reverb.process(buf, n)
 
-        // 7. Output volume (smoothed) and limiter
+        // 7. Dry/wet blend (smoothed)
+        if (mixOn) {
+            var m = curMix
+            val tw = p.dryWet
+            for (i in 0 until n) {
+                m = tw + (m - tw) * smoothCoef
+                buf[i] = dry[i] * (1f - m) + buf[i] * m
+            }
+            curMix = m
+        } else {
+            curMix = if (fx) p.dryWet else 1f
+        }
+
+        // 8. Output volume (smoothed) and limiter
         var v = curVolume
         for (i in 0 until n) {
             v = p.outputVolume + (v - p.outputVolume) * smoothCoef
@@ -160,15 +191,20 @@ class AudioProcessingPipeline(val sampleRate: Int) {
         outputPeak = outputPeak, outputRms = outputRms,
         holdPeak = holdPeak, clipping = blockClipped, clipCount = totalClipped,
         rawInputClipped = rawInputClipped,
-        reductionDb = reductionDb, voiceActive = voiceActive, noiseFloorDb = noiseFloorDb
+        reductionDb = reductionDb, limiterReductionDb = limiterReductionDb,
+        voiceActive = voiceActive, noiseFloorDb = noiseFloorDb
     )
 
     fun reset() {
         highPass.reset(); noise.reset(); pitch.reset(); tone.reset(); echo.reset(); reverb.reset(); limiter.reset()
-        curGain = 1f; curVolume = params.outputVolume
+        curGain = 1f; curVolume = params.outputVolume; curMix = 1f
     }
 
-    /** Hard ceiling of the final limiter. */
+    /** Current ceiling of the final limiter (linear). */
     val ceiling: Float get() = limiter.ceiling
 
+    companion object {
+        /** Largest block that supports the dry/wet blend without allocating. */
+        const val MAX_BLOCK = 8192
+    }
 }

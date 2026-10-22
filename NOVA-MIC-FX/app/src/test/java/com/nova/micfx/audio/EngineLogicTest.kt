@@ -80,4 +80,32 @@ class EngineLogicTest {
         assertEquals(10f, BufferSizing.durationMs(480, 48000), 1e-4f)
         assertEquals(0f, BufferSizing.durationMs(480, 0), 0f)
     }
+
+    @Test fun repeatedStartStopCyclesStayConsistent() {
+        val m = EngineStateMachine()
+        repeat(100) {
+            assertTrue(m.transition(EngineState.STARTING))
+            assertFalse("second start while starting must be rejected", m.transition(EngineState.STARTING))
+            assertTrue(m.transition(EngineState.RUNNING))
+            assertFalse(m.transition(EngineState.STARTING))
+            assertTrue(m.transition(EngineState.STOPPING))
+            assertFalse(m.transition(EngineState.STOPPING))
+            assertTrue(m.transition(EngineState.IDLE))
+        }
+        assertEquals(EngineState.IDLE, m.state)
+    }
+
+    @Test fun recoveryPathsAreLegal() {
+        val m = EngineStateMachine()
+        m.transition(EngineState.STARTING); m.transition(EngineState.RUNNING)
+        assertTrue(m.transition(EngineState.RECOVERING))
+        assertTrue(m.transition(EngineState.RUNNING))
+        assertTrue(m.transition(EngineState.RECOVERING))
+        assertTrue(m.transition(EngineState.ERROR))
+        assertTrue(m.transition(EngineState.IDLE))
+        assertFalse(m.transition(EngineState.RECOVERING))
+        m.transition(EngineState.STARTING)
+        assertTrue(m.transition(EngineState.RECOVERING))
+        assertTrue(m.transition(EngineState.STOPPING))
+    }
 }

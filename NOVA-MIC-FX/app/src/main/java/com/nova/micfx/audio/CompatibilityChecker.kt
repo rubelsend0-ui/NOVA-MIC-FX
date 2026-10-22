@@ -3,12 +3,13 @@ package com.nova.micfx.audio
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.AudioTrack
 import android.os.Build
 import androidx.core.content.ContextCompat
-
-enum class CompatStatus { OK, WARN, NO, INFO }
-data class CompatItem(val title: String, val status: CompatStatus, val detail: String)
 
 /** Reports what this device can really do. Nothing here is assumed: every line comes from a platform query. */
 class CompatibilityChecker(context: Context, private val devices: AudioDeviceManager) {
@@ -36,6 +37,9 @@ class CompatibilityChecker(context: Context, private val devices: AudioDeviceMan
         val burst = am.getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
         list += CompatItem("Native output format", CompatStatus.INFO,
             "Sample rate: ${rate ?: "unknown"} Hz, burst size: ${burst ?: "unknown"} frames.")
+        val rates = supportedSampleRates()
+        list += CompatItem("Supported sample rates", if (rates.isEmpty()) CompatStatus.NO else CompatStatus.OK,
+            if (rates.isEmpty()) "No supported rate found." else rates.joinToString(", ") { "$it Hz" })
 
         val av = AudioEffectController.availability()
         list += CompatItem("System noise suppressor", if (av.noiseSuppressor) CompatStatus.OK else CompatStatus.WARN,
@@ -57,12 +61,24 @@ class CompatibilityChecker(context: Context, private val devices: AudioDeviceMan
         list += CompatItem("Local monitoring (Mode A)", if (canMonitor) CompatStatus.OK else CompatStatus.WARN,
             if (canMonitor) "Processed audio can be monitored on your headphones." else "Needs microphone permission and headphones.")
 
-        list += CompatItem("Processed audio into other apps (Mode B)", CompatStatus.NO,
-            "Not supported. Android has no public API that lets an ordinary app replace another app's microphone input. " +
-                "NOVA MIC FX does not use root, hidden APIs or accessibility tricks, so it cannot feed games, Discord or calls.")
 
         list += CompatItem("Android version", CompatStatus.INFO,
             "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}). From Android 10, apps in the background may receive silence from the microphone.")
         return list
+    }
+
+    /** Sample rates the platform really accepts for both capture and playback. */
+    fun supportedSampleRates(): List<Int> = BufferSizing.SUPPORTED_RATES.filter { r ->
+        AudioRecord.getMinBufferSize(r, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT) > 0 &&
+            AudioTrack.getMinBufferSize(r, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT) > 0
+    }
+
+    fun summary(): CapabilitySummary {
+        val hasMic = pm.hasSystemFeature(PackageManager.FEATURE_MICROPHONE)
+        val perm = ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val usbIn = am.getDevices(AudioManager.GET_DEVICES_INPUTS).any {
+            it.type == AudioDeviceInfo.TYPE_USB_DEVICE || it.type == AudioDeviceInfo.TYPE_USB_HEADSET || it.type == AudioDeviceInfo.TYPE_USB_ACCESSORY
+        }
+        return CapabilityModel.summarize(hasMic, perm, devices.hasHeadphoneOutput(), usbIn)
     }
 }
